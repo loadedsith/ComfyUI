@@ -2358,6 +2358,7 @@ async def init_builtin_extra_nodes():
         "nodes_rope.py",
         "nodes_logic.py",
         "nodes_nop.py",
+        "nodes_diffusers_pipeline.py",
     ]
 
     import_failed = []

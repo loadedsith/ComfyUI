@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
+import comfy.utils
 
 import folder_paths
 
@@ -424,105 +425,8 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     # Likely [batch, samples, channels], transpose
                     audio_tensor = audio_tensor.transpose(1, 2)
                 return audio_tensor
-            else:
-                raise ValueError(f"Unexpected audio tensor shape: {audio_tensor.shape}")
         
-        # WhisperSpeech doesn't provide duration limits or text position feedback.
-        # step_callback is called during generation but provides no arguments.
-        # Strategy: Use step_callback to track progress and implement duration-based early exit.
-        
-        # First, try generating the full text - WhisperSpeech might handle it
-        estimated_duration = len(text) / cps if cps > 0 else 0
-        
-        if estimated_duration <= max_chunk_duration:
-            # Try generating in one go with step tracking
-            logging.info(f"Attempting to generate full text ({len(text)} chars, estimated ~{estimated_duration:.1f}s)")
-            try:
-                # Use step_callback to track generation progress
-                step_info = {'s2a_steps': 0}  # Track s2a steps (correlate to audio duration)
-                
-                def track_progress():
-                    step_info['s2a_steps'] += 1
-                
-                audio = pipe.generate(text=text, lang=lang, cps=cps, step_callback=track_progress)
-                audio = normalize_audio_shape(audio)
-                
-                actual_duration = audio.shape[2] / sample_rate if len(audio.shape) >= 3 else audio.shape[1] / sample_rate
-                logging.info(f"Generated full text successfully ({actual_duration:.2f}s, {step_info['s2a_steps']} s2a steps)")
-                
-                return io.NodeOutput({
-                    "waveform": audio,
-                    "sample_rate": sample_rate
-                })
-            except Exception as e:
-                # If generation fails, fall back to chunking
-                logging.warning(f"Full text generation failed, falling back to chunking: {e}")
-        
-        # Chunking needed - use step_callback to measure actual generation rate
-        logging.info(f"Text appears long ({len(text)} chars). Using step_callback to measure generation rate...")
-        
-        # Measure actual CPS by generating a sample with step tracking
-        sample_size = min(100, len(text))
-        step_info = {'s2a_steps': 0}
-        
-        def track_steps():
-            step_info['s2a_steps'] += 1
-        
-        try:
-            test_audio = pipe.generate(text=text[:sample_size], lang=lang, cps=cps, step_callback=track_steps)
-            test_audio = normalize_audio_shape(test_audio)
-            test_duration = test_audio.shape[2] / sample_rate if len(test_audio.shape) >= 3 else test_audio.shape[1] / sample_rate
-            
-            # Calculate actual CPS from measured duration
-            actual_cps = sample_size / test_duration if test_duration > 0 else cps
-            
-            # Also calculate steps per second for future duration estimation
-            steps_per_second = step_info['s2a_steps'] / test_duration if test_duration > 0 else None
-            
-            logging.info(
-                f"Measured: {actual_cps:.2f} chars/sec, "
-                f"{steps_per_second:.1f} s2a steps/sec (user CPS estimate: {cps:.2f})"
-            )
-        except Exception as e:
-            logging.warning(f"Could not measure generation rate, using user estimate: {e}")
-            actual_cps = cps
-            steps_per_second = None
-        
-        # Re-estimate duration with measured CPS
-        estimated_duration = len(text) / actual_cps if actual_cps > 0 else 0
-        
-        logging.info(
-            f"Text length ({len(text)} chars) estimated at ~{estimated_duration:.1f}s. "
-            f"Splitting into chunks at word boundaries (max {max_chunk_duration}s per chunk)."
-        )
-        
-        # Split text into chunks using measured CPS
-        chunks = chunk_text_for_tts(text, max_chunk_duration, actual_cps, lookback_chars)
-        
-        # Verify all text is covered
-        total_chunked_chars = sum(end - start for start, end, _ in chunks)
-        if total_chunked_chars < len(text):
-            missing = len(text) - total_chunked_chars
-            logging.warning(f"Chunking missed {missing} characters! Total text: {len(text)}, chunked: {total_chunked_chars}")
-            # Add the missing text as a final chunk
-            last_end = chunks[-1][1] if chunks else 0
-            if last_end < len(text):
-                missing_text = text[last_end:].strip()
-                if missing_text:
-                    logging.info(f"Adding missing text as final chunk: '{missing_text[:50]}...'")
-                    chunks.append((last_end, len(text), missing_text))
-        
-        logging.info(f"Split text into {len(chunks)} chunks (total {sum(end - start for start, end, _ in chunks)} chars)")
-        
-        # Generate audio for each chunk with sliding window continuity
-        # Use atoks_prompt to maintain prosody/intonation across chunks
-        # Note: stoks_prompt is NOT used because it causes text repetition
-        # (t2s.generate prepends stoks_prompt, duplicating tokens in the output)
-        audio_chunks = []
-        stoks_prompt = None  # Not used - causes text repetition
-        atoks_prompt = None  # Audio tokens from previous chunk (used for continuity)
-        
-        # Get speaker embedding
+        # Get speaker embedding BEFORE any generation
         # If reference_audio is provided, extract speaker embedding from it (voice cloning)
         # Otherwise, use default speaker
         # Check if reference_audio is valid (not None, is dict, has required keys, and has actual data)
@@ -617,7 +521,7 @@ class WhisperSpeechGenerate(io.ComfyNode):
             else:
                 logging.info("No reference audio provided, using default speaker embedding")
         
-        # Normalize speaker embedding once before the loop (reuse for all chunks)
+        # Normalize speaker embedding once (will be reused for all generation)
         # s2a.generate() expects speaker as 2D [batch, features]
         original_speaker_shape = speaker.shape
         if len(speaker.shape) == 1:
@@ -650,10 +554,160 @@ class WhisperSpeechGenerate(io.ComfyNode):
         # Final validation
         if len(speaker_normalized.shape) != 2:
             raise RuntimeError(f"speaker_normalized must be 2D for s2a.generate, got shape {speaker_normalized.shape} (original: {original_speaker_shape})")
-        logging.info(f"Normalized speaker embedding once: shape {speaker_normalized.shape} (will be reused for all {len(chunks)} chunks)")
+        logging.info(f"Normalized speaker embedding: shape {speaker_normalized.shape}")
+        
+        # Initialize progress bar for UI updates
+        # Estimate total steps: 1 for speaker extraction + 1 for each chunk + 1 for CPS measurement if needed
+        estimated_duration = len(text) / cps if cps > 0 else 0
+        estimated_chunks = max(1, int(estimated_duration / max_chunk_duration) + 1)
+        total_progress_steps = 1 + estimated_chunks + 1  # speaker + chunks + measurement
+        progress_bar = comfy.utils.ProgressBar(total_progress_steps)
+        current_progress = 0
+        
+        # Update progress: speaker extraction complete
+        progress_bar.update_absolute(current_progress, total=total_progress_steps)
+        current_progress += 1
+        
+        # WhisperSpeech doesn't provide duration limits or text position feedback.
+        # step_callback is called during generation but provides no arguments.
+        # Strategy: Use step_callback to track progress and implement duration-based early exit.
+        
+        # First, try generating the full text - but use manual t2s/s2a path to ensure speaker is used
+        if estimated_duration <= max_chunk_duration:
+            # Generate using manual t2s/s2a path to ensure speaker embedding is used
+            logging.info(f"Attempting to generate full text ({len(text)} chars, estimated ~{estimated_duration:.1f}s) with speaker embedding")
+            try:
+                # Update progress: starting generation
+                progress_bar.update_absolute(current_progress, total=total_progress_steps)
+                
+                # Generate semantic tokens
+                stoks_result = pipe.t2s.generate(text, cps=cps, lang=lang, stoks_prompt=None)
+                stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
+                
+                # Normalize stoks to 1D
+                if len(stoks.shape) > 1:
+                    stoks = stoks[0] if stoks.shape[0] == 1 else stoks[0]
+                
+                # Update progress: t2s complete, starting s2a
+                progress_bar.update_absolute(current_progress + 0.5, total=total_progress_steps)
+                
+                # Generate audio tokens with speaker embedding
+                atoks = pipe.s2a.generate(stoks, speaker_normalized, langs=None, atoks_prompt=None)
+                
+                # Update progress: s2a complete, starting vocoder
+                progress_bar.update_absolute(current_progress + 0.8, total=total_progress_steps)
+                
+                # Decode to waveform
+                audio = pipe.vocoder.decode(atoks)
+                audio = normalize_audio_shape(audio)
+                
+                # Update progress: complete
+                progress_bar.update_absolute(total_progress_steps, total=total_progress_steps)
+                
+                actual_duration = audio.shape[2] / sample_rate if len(audio.shape) >= 3 else audio.shape[1] / sample_rate
+                logging.info(f"Generated full text successfully with speaker embedding ({actual_duration:.2f}s)")
+                
+                return io.NodeOutput({
+                    "waveform": audio,
+                    "sample_rate": sample_rate
+                })
+            except Exception as e:
+                # If generation fails, fall back to chunking
+                logging.warning(f"Full text generation failed, falling back to chunking: {e}")
+        
+        # Chunking needed - use step_callback to measure actual generation rate
+        logging.info(f"Text appears long ({len(text)} chars). Using step_callback to measure generation rate...")
+        
+        # Update progress: measuring generation rate
+        progress_bar.update_absolute(current_progress, total=total_progress_steps)
+        current_progress += 1
+        
+        # Measure actual CPS by generating a sample with step tracking (using speaker embedding)
+        sample_size = min(100, len(text))
+        step_info = {'s2a_steps': 0}
+        
+        def track_steps():
+            step_info['s2a_steps'] += 1
+        
+        try:
+            # Use manual t2s/s2a path to ensure speaker is used
+            test_stoks_result = pipe.t2s.generate(text[:sample_size], cps=cps, lang=lang, stoks_prompt=None)
+            test_stoks = test_stoks_result[0] if isinstance(test_stoks_result, tuple) else test_stoks_result
+            if len(test_stoks.shape) > 1:
+                test_stoks = test_stoks[0] if test_stoks.shape[0] == 1 else test_stoks[0]
+            test_atoks = pipe.s2a.generate(test_stoks, speaker_normalized, langs=None, atoks_prompt=None, step=track_steps)
+            test_audio = pipe.vocoder.decode(test_atoks)
+            test_audio = normalize_audio_shape(test_audio)
+            test_duration = test_audio.shape[2] / sample_rate if len(test_audio.shape) >= 3 else test_audio.shape[1] / sample_rate
+            
+            # Calculate actual CPS from measured duration
+            actual_cps = sample_size / test_duration if test_duration > 0 else cps
+            
+            # Also calculate steps per second for future duration estimation
+            steps_per_second = step_info['s2a_steps'] / test_duration if test_duration > 0 else None
+            
+            logging.info(
+                f"Measured: {actual_cps:.2f} chars/sec, "
+                f"{steps_per_second:.1f} s2a steps/sec (user CPS estimate: {cps:.2f})"
+            )
+        except Exception as e:
+            logging.warning(f"Could not measure generation rate, using user estimate: {e}")
+            actual_cps = cps
+            steps_per_second = None
+        
+        # Recalculate total progress steps based on actual chunk count
+        estimated_duration = len(text) / actual_cps if actual_cps > 0 else 0
+        estimated_chunks = max(1, int(estimated_duration / max_chunk_duration) + 1)
+        total_progress_steps = current_progress + estimated_chunks  # speaker + measurement + chunks
+        progress_bar.update_absolute(current_progress, total=total_progress_steps)
+        
+        # Re-estimate duration with measured CPS
+        estimated_duration = len(text) / actual_cps if actual_cps > 0 else 0
+        
+        logging.info(
+            f"Text length ({len(text)} chars) estimated at ~{estimated_duration:.1f}s. "
+            f"Splitting into chunks at word boundaries (max {max_chunk_duration}s per chunk)."
+        )
+        
+        # Split text into chunks using measured CPS
+        chunks = chunk_text_for_tts(text, max_chunk_duration, actual_cps, lookback_chars)
+        
+        # Verify all text is covered
+        total_chunked_chars = sum(end - start for start, end, _ in chunks)
+        if total_chunked_chars < len(text):
+            missing = len(text) - total_chunked_chars
+            logging.warning(f"Chunking missed {missing} characters! Total text: {len(text)}, chunked: {total_chunked_chars}")
+            # Add the missing text as a final chunk
+            last_end = chunks[-1][1] if chunks else 0
+            if last_end < len(text):
+                missing_text = text[last_end:].strip()
+                if missing_text:
+                    logging.info(f"Adding missing text as final chunk: '{missing_text[:50]}...'")
+                    chunks.append((last_end, len(text), missing_text))
+        
+        logging.info(f"Split text into {len(chunks)} chunks (total {sum(end - start for start, end, _ in chunks)} chars)")
+        
+        # Generate audio for each chunk with sliding window continuity
+        # Use atoks_prompt to maintain prosody/intonation across chunks
+        # Note: stoks_prompt is NOT used because it causes text repetition
+        # (t2s.generate prepends stoks_prompt, duplicating tokens in the output)
+        # Speaker embedding is already extracted and normalized above
+        audio_chunks = []
+        stoks_prompt = None  # Not used - causes text repetition
+        atoks_prompt = None  # Audio tokens from previous chunk (used for continuity)
+        
+        logging.info(f"Using speaker embedding: shape {speaker_normalized.shape} (will be reused for all {len(chunks)} chunks)")
+        
+        # Update total progress to match actual chunk count
+        total_progress_steps = current_progress + len(chunks)
+        progress_bar.update_absolute(current_progress, total=total_progress_steps)
         
         for i, (start_pos, end_pos, chunk_text) in enumerate(chunks):
             logging.info(f"Generating chunk {i+1}/{len(chunks)}: '{chunk_text[:50]}...' ({end_pos - start_pos} chars)")
+            
+            # Update progress: starting chunk
+            chunk_progress_base = current_progress + i
+            progress_bar.update_absolute(chunk_progress_base, total=total_progress_steps)
             
             # Track steps for this chunk
             chunk_steps = {'t2s_steps': 0, 's2a_steps': 0}
@@ -667,6 +721,8 @@ class WhisperSpeechGenerate(io.ComfyNode):
             # Note: We don't use stoks_prompt because it causes text repetition
             # (t2s.generate prepends stoks_prompt, which duplicates tokens)
             # Instead, we rely on atoks_prompt for audio-level continuity
+            progress_bar.update_absolute(chunk_progress_base + 0.2, total=total_progress_steps)
+            
             stoks_result = pipe.t2s.generate(
                 chunk_text, 
                 cps=cps, 
@@ -675,6 +731,9 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 step=track_chunk_steps
             )
             stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
+            
+            # Update progress: t2s complete
+            progress_bar.update_absolute(chunk_progress_base + 0.4, total=total_progress_steps)
             
             # Log original shapes for debugging
             logging.info(f"  Raw stoks shape: {stoks.shape}, speaker shape: {speaker_normalized.shape}")
@@ -714,6 +773,8 @@ class WhisperSpeechGenerate(io.ComfyNode):
             
             # Generate audio tokens (atoks) from semantic tokens
             # Use atoks_prompt from previous chunk for continuity
+            progress_bar.update_absolute(chunk_progress_base + 0.5, total=total_progress_steps)
+            
             atoks = pipe.s2a.generate(
                 stoks_final,
                 speaker_final,
@@ -722,8 +783,14 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 step=track_chunk_steps
             )
             
+            # Update progress: s2a complete
+            progress_bar.update_absolute(chunk_progress_base + 0.8, total=total_progress_steps)
+            
             # Decode audio tokens to waveform
             chunk_audio = pipe.vocoder.decode(atoks)
+            
+            # Update progress: chunk complete
+            progress_bar.update_absolute(chunk_progress_base + 1, total=total_progress_steps)
             chunk_audio = normalize_audio_shape(chunk_audio)
             
             chunk_duration = chunk_audio.shape[2] / sample_rate if len(chunk_audio.shape) >= 3 else chunk_audio.shape[1] / sample_rate
@@ -810,6 +877,9 @@ class WhisperSpeechGenerate(io.ComfyNode):
         # Calculate total duration (dim=2 is samples dimension)
         total_samples = final_audio.shape[2] if len(final_audio.shape) >= 3 else final_audio.shape[1]
         logging.info(f"Generated {len(chunks)} chunks, total audio length: {total_samples / sample_rate:.2f}s")
+        
+        # Update progress: all chunks complete
+        progress_bar.update_absolute(total_progress_steps, total=total_progress_steps)
         
         # Check if audio ends cleanly (near zero crossing) - helps diagnose if model finished properly
         # If audio doesn't end near zero, the model may not have completed generation
