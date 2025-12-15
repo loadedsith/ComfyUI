@@ -306,7 +306,7 @@ def chunk_text_for_tts(
                 # No boundary found, take max_chars_per_chunk or find next boundary
                 chunk_end = min(current_pos + max_chars_per_chunk, total_chars)
                 # Try to find any boundary after current_pos
-                next_boundaries = [b for b in boundaries if b > current_pos and b <= chunk_end]
+                next_boundaries = [b for b in word_boundaries if b > current_pos and b <= chunk_end]
                 if next_boundaries:
                     chunk_end = next_boundaries[0]
                 # If still no boundary found, force a chunk of max size
@@ -316,7 +316,7 @@ def chunk_text_for_tts(
             # Ensure minimum chunk size (unless it's truly the last bit of text)
             if chunk_end - current_pos < min_chunk_size and remaining_chars > max_chars_per_chunk:
                 # Look for a boundary further ahead
-                further_boundaries = [b for b in boundaries if b > chunk_end and b <= current_pos + max_chars_per_chunk * 1.5]
+                further_boundaries = [b for b in word_boundaries if b > chunk_end and b <= current_pos + max_chars_per_chunk * 1.5]
                 if further_boundaries:
                     chunk_end = further_boundaries[0]
                 # If no further boundary, take max_chars_per_chunk
@@ -339,7 +339,7 @@ def chunk_text_for_tts(
             current_pos = min(current_pos + 1, total_chars)
             if current_pos < total_chars:
                 # Try to find next word boundary
-                next_boundaries = [b for b in boundaries if b > current_pos]
+                next_boundaries = [b for b in word_boundaries if b > current_pos]
                 if next_boundaries:
                     current_pos = next_boundaries[0]
     
@@ -435,21 +435,17 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     tooltip="Base characters per second (speaking rate). Used to estimate chunk boundaries. "
                            "Actual CPS may vary per sentence based on emotion intensity and punctuation."
                 ),
-                io.Float.Input(
+                io.String.Input(
                     "emotion_intensity",
-                    default=1.0,
-                    min=0.0,
-                    max=2.0,
+                    default="1.0",
                     tooltip="Emotion intensity (0.0 = neutral, 1.0 = normal, 2.0 = very expressive). "
                            "Higher values make exclamations (!) more energetic and questions (?) more thoughtful. "
                            "Helps get closer to OpenAI TTS quality for emotional expression."
                 ),
-                io.Float.Input(
+                io.String.Input(
                     "max_chunk_duration",
-                    default=25.0,
-                    min=5.0,
-                    max=30.0,
-                    tooltip="Maximum duration per chunk in seconds. Text exceeding this will be split at sentence boundaries when possible."
+                    default="25.0",
+                    tooltip="Maximum duration per chunk in seconds (5.0-30.0). Text exceeding this will be split at sentence boundaries when possible."
                 ),
                 io.Int.Input(
                     "lookback_chars",
@@ -458,21 +454,17 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     max=200,
                     tooltip="Maximum characters to look back when finding word boundaries for chunking."
                 ),
-                io.Int.Input(
+                io.String.Input(
                     "prompt_tokens",
-                    default=50,
-                    min=10,
-                    max=200,
-                    tooltip="Number of tokens from previous chunk to use as prompt for continuity. "
+                    default="50",
+                    tooltip="Number of tokens from previous chunk to use as prompt for continuity (10-200). "
                            "Higher values maintain better prosody/intonation but use more memory."
                 ),
-                io.Int.Input(
+                io.String.Input(
                     "seed",
-                    default=0,
-                    min=0,
-                    max=0x7fffffff,
+                    default="",
                     optional=True,
-                    tooltip="Random seed for reproducibility. 0 = random. Set to a fixed value for consistent results."
+                    tooltip="Random seed for reproducibility. Empty string or 'randomize' = random. Set to a number for consistent results."
                 ),
                 io.Combo.Input(
                     "t2s_ref",
@@ -504,21 +496,66 @@ class WhisperSpeechGenerate(io.ComfyNode):
         text: str,
         lang: str = "en",
         cps: float = 15.0,
-        emotion_intensity: float = 1.0,
-        max_chunk_duration: float = 25.0,
+        emotion_intensity: str = "1.0",
+        max_chunk_duration: str = "25.0",
         lookback_chars: int = 50,
-        prompt_tokens: int = 50,
-        seed: Optional[int] = None,
+        prompt_tokens: str = "50",
+        seed: Optional[str] = None,
         reference_audio: Optional[io.Audio] = None,
         t2s_ref: Optional[str] = None,
         s2a_ref: Optional[str] = None
     ) -> io.NodeOutput:
+        # Parse and validate emotion_intensity (0.0-2.0)
+        try:
+            emotion_intensity_float = float(str(emotion_intensity).strip()) if emotion_intensity else 1.0
+            emotion_intensity_float = max(0.0, min(2.0, emotion_intensity_float))
+            if emotion_intensity_float != float(str(emotion_intensity).strip()):
+                logging.warning(f"emotion_intensity clamped from {emotion_intensity} to {emotion_intensity_float}")
+        except (ValueError, TypeError):
+            logging.warning(f"Invalid emotion_intensity value '{emotion_intensity}', using default 1.0")
+            emotion_intensity_float = 1.0
+        
+        # Parse and validate max_chunk_duration (5.0-30.0)
+        try:
+            max_chunk_duration_float = float(str(max_chunk_duration).strip()) if max_chunk_duration else 25.0
+            max_chunk_duration_float = max(5.0, min(30.0, max_chunk_duration_float))
+            if max_chunk_duration_float != float(str(max_chunk_duration).strip()):
+                logging.warning(f"max_chunk_duration clamped from {max_chunk_duration} to {max_chunk_duration_float}")
+        except (ValueError, TypeError):
+            logging.warning(f"Invalid max_chunk_duration value '{max_chunk_duration}', using default 25.0")
+            max_chunk_duration_float = 25.0
+        
+        # Validate and clamp other parameters
+        cps = max(5.0, min(50.0, cps))
+        lookback_chars = max(0, min(200, lookback_chars))
+        
+        # Use the parsed float values
+        emotion_intensity = emotion_intensity_float
+        max_chunk_duration = max_chunk_duration_float
+        
+        # Parse prompt_tokens (handle string input)
+        try:
+            prompt_tokens_int = int(str(prompt_tokens).strip()) if prompt_tokens else 50
+            prompt_tokens_int = max(10, min(200, prompt_tokens_int))  # Clamp to valid range
+        except (ValueError, TypeError):
+            logging.warning(f"Invalid prompt_tokens value '{prompt_tokens}', using default 50")
+            prompt_tokens_int = 50
+        
         # Set random seed for reproducibility
-        if seed is not None and seed > 0:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-            logging.info(f"Using seed: {seed}")
+        # Handle seed as string (can be empty, "randomize", or a number)
+        seed_value = None
+        if seed:
+            seed_str = str(seed).strip().lower()
+            if seed_str and seed_str != "randomize" and seed_str != "":
+                try:
+                    seed_value = int(seed_str)
+                    if seed_value > 0:
+                        torch.manual_seed(seed_value)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(seed_value)
+                        logging.info(f"Using seed: {seed_value}")
+                except (ValueError, TypeError):
+                    logging.warning(f"Invalid seed value '{seed}', using random seed")
         
         # Preprocess text for emotional expression
         if emotion_intensity > 0.0:
@@ -1032,7 +1069,7 @@ class WhisperSpeechGenerate(io.ComfyNode):
                         tokens_per_second = total_tokens / chunk_duration if chunk_duration > 0 else 0
                         if tokens_per_second > 0:
                             # Estimate overlap duration from prompt_tokens
-                            overlap_duration = prompt_tokens / tokens_per_second
+                            overlap_duration = prompt_tokens_int / tokens_per_second
                             # Add a buffer (20%) to ensure we trim enough - the model may include
                             # more overlap than just the prompt tokens
                             overlap_duration *= 1.2
@@ -1069,15 +1106,15 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 if len(atoks.shape) == 3:
                     # [batch, quantizers, tokens] - extract and keep batch dimension
                     token_dim = atoks.shape[2]
-                    if token_dim > prompt_tokens:
-                        atoks_prompt = atoks[:, :, -prompt_tokens:]  # Keep batch dim: [batch, quantizers, prompt_tokens]
+                    if token_dim > prompt_tokens_int:
+                        atoks_prompt = atoks[:, :, -prompt_tokens_int:]  # Keep batch dim: [batch, quantizers, prompt_tokens]
                     else:
                         atoks_prompt = atoks  # Keep all: [batch, quantizers, tokens]
                 elif len(atoks.shape) == 2:
                     # [quantizers, tokens] - add batch dimension
                     token_dim = atoks.shape[1]
-                    if token_dim > prompt_tokens:
-                        atoks_prompt = atoks[:, -prompt_tokens:].unsqueeze(0)  # Add batch: [1, quantizers, prompt_tokens]
+                    if token_dim > prompt_tokens_int:
+                        atoks_prompt = atoks[:, -prompt_tokens_int:].unsqueeze(0)  # Add batch: [1, quantizers, prompt_tokens]
                     else:
                         atoks_prompt = atoks.unsqueeze(0)  # Add batch: [1, quantizers, tokens]
                 else:
