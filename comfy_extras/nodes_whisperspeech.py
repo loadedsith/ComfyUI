@@ -46,6 +46,125 @@ def get_whisperspeech_models():
         return ([""], [""])
 
 
+def preprocess_text_for_emotion(text: str, emotion_intensity: float = 1.0) -> str:
+    """
+    Preprocess text to enhance emotional expression.
+    
+    Adds subtle emphasis markers and adjusts spacing around punctuation
+    to help the model better express emotions, especially for exclamations.
+    
+    Args:
+        text: Input text
+        emotion_intensity: Intensity multiplier (0.0 = neutral, 1.0 = normal, 2.0 = very expressive)
+    
+    Returns:
+        Preprocessed text with enhanced emotional markers
+    """
+    if emotion_intensity <= 0.0:
+        return text
+    
+    # Split into sentences to process each independently
+    sentences = re.split(r'([.!?]+)', text)
+    processed_sentences = []
+    
+    for i, sentence in enumerate(sentences):
+        if not sentence.strip():
+            processed_sentences.append(sentence)
+            continue
+        
+        # Detect exclamation marks - enhance them
+        if '!' in sentence and emotion_intensity > 0.5:
+            # Add slight spacing before exclamation for emphasis
+            # Multiple exclamations = more intensity
+            exclamation_count = sentence.count('!')
+            if exclamation_count > 1:
+                # Multiple !!! = very excited
+                sentence = sentence.replace('!!!', ' !!! ')
+                sentence = sentence.replace('!!', ' !! ')
+            elif exclamation_count == 1:
+                # Single ! = moderate excitement
+                sentence = sentence.replace('!', ' !', 1)
+        
+        # Detect question marks - add slight pause
+        if '?' in sentence and emotion_intensity > 0.5:
+            question_count = sentence.count('?')
+            if question_count > 1:
+                sentence = sentence.replace('???', ' ??? ')
+                sentence = sentence.replace('??', ' ?? ')
+        
+        processed_sentences.append(sentence)
+    
+    result = ''.join(processed_sentences)
+    # Clean up multiple spaces
+    result = re.sub(r' +', ' ', result)
+    return result.strip()
+
+
+def get_sentence_cps_modulation(text: str, base_cps: float, emotion_intensity: float = 1.0) -> List[Tuple[int, int, float]]:
+    """
+    Calculate CPS modulation per sentence based on punctuation for emotional expression.
+    
+    Returns list of (start_pos, end_pos, cps_multiplier) segments.
+    Exclamations get faster CPS (more energetic), questions get slightly slower (more thoughtful).
+    
+    Args:
+        text: Full text
+        base_cps: Base characters per second
+        emotion_intensity: Intensity of emotion modulation (0.0 = none, 1.0 = normal, 2.0 = strong)
+    
+    Returns:
+        List of (start_pos, end_pos, cps_multiplier) tuples
+    """
+    if emotion_intensity <= 0.0:
+        return [(0, len(text), 1.0)]
+    
+    segments = []
+    current_pos = 0
+    
+    # Split by sentence boundaries
+    sentence_pattern = r'([^.!?]*[.!?]+)'
+    sentences = re.finditer(sentence_pattern, text)
+    
+    for match in sentences:
+        start = match.start()
+        sentence = match.group(0)
+        end = match.end()
+        
+        # Determine CPS multiplier based on punctuation
+        cps_multiplier = 1.0
+        
+        if '!' in sentence:
+            # Exclamations: faster = more energetic/excited
+            exclamation_count = sentence.count('!')
+            # Base speedup for exclamations
+            speedup = 1.0 + (0.15 * emotion_intensity)  # 15% faster per intensity level
+            # Multiple exclamations = even faster
+            if exclamation_count > 1:
+                speedup += 0.1 * (exclamation_count - 1) * emotion_intensity
+            cps_multiplier = min(speedup, 1.5)  # Cap at 50% faster
+        
+        elif '?' in sentence:
+            # Questions: slightly slower = more thoughtful/curious
+            question_count = sentence.count('?')
+            slowdown = 1.0 - (0.05 * emotion_intensity)  # 5% slower per intensity level
+            if question_count > 1:
+                slowdown -= 0.03 * (question_count - 1) * emotion_intensity
+            cps_multiplier = max(slowdown, 0.85)  # Cap at 15% slower
+        
+        # Fill gap between sentences
+        if start > current_pos:
+            segments.append((current_pos, start, 1.0))
+        
+        segments.append((start, end, cps_multiplier))
+        current_pos = end
+    
+    # Add remaining text
+    if current_pos < len(text):
+        segments.append((current_pos, len(text), 1.0))
+    
+    return segments if segments else [(0, len(text), 1.0)]
+
+
 def find_word_boundaries(text: str) -> List[int]:
     """
     Find word boundary positions in text.
@@ -105,24 +224,40 @@ def find_nearest_word_boundary(text: str, target_pos: int, boundaries: List[int]
     return max(0, start_pos)
 
 
+def find_sentence_boundaries(text: str) -> List[int]:
+    """
+    Find sentence boundary positions in text (after punctuation: . ! ?).
+    Returns list of character indices where sentences end (including end of text).
+    """
+    boundaries = [0]  # Start of text is always a boundary
+    # Find sentence endings (., !, ? followed by space or end of text)
+    for match in re.finditer(r'[.!?]+(?:\s+|$)', text):
+        pos = match.end()
+        if pos > 0:
+            boundaries.append(pos)
+    boundaries.append(len(text))  # End of text
+    return sorted(set(boundaries))
+
+
 def chunk_text_for_tts(
     text: str,
     max_chunk_duration: float,
     cps: float,
-    lookback_chars: int = 50
+    lookback_chars: int = 50,
+    prefer_sentences: bool = True
 ) -> List[Tuple[int, int, str]]:
     """
     Split text into chunks suitable for TTS generation.
     
-    Uses word boundaries to ensure natural breaks. Estimates chunk size based on
-    characters per second, but finds the nearest word boundary to avoid cutting
-    words in half.
+    Prefers sentence boundaries for better emotional continuity, falls back to word
+    boundaries when needed. Estimates chunk size based on characters per second.
     
     Args:
         text: Full text to chunk
         max_chunk_duration: Maximum duration per chunk in seconds
         cps: Characters per second (speaking rate)
         lookback_chars: Maximum characters to look back for word boundary
+        prefer_sentences: If True, prefer sentence boundaries over word boundaries
     
     Returns:
         List of tuples: (start_pos, end_pos, chunk_text)
@@ -130,7 +265,9 @@ def chunk_text_for_tts(
     if not text.strip():
         return []
     
-    boundaries = find_word_boundaries(text)
+    # Get both sentence and word boundaries
+    sentence_boundaries = find_sentence_boundaries(text) if prefer_sentences else []
+    word_boundaries = find_word_boundaries(text)
     chunks = []
     current_pos = 0
     total_chars = len(text)
@@ -151,8 +288,18 @@ def chunk_text_for_tts(
             # Estimate end position for this chunk
             target_end = min(current_pos + max_chars_per_chunk, total_chars)
             
-            # Find nearest word boundary before target
-            chunk_end = find_nearest_word_boundary(text, target_end, boundaries, lookback_chars)
+            # Prefer sentence boundaries for better emotional continuity
+            chunk_end = None
+            if prefer_sentences and sentence_boundaries:
+                # Find nearest sentence boundary before or at target
+                valid_sentences = [b for b in sentence_boundaries if current_pos < b <= target_end + lookback_chars]
+                if valid_sentences:
+                    # Prefer sentence boundary closest to target (but not before current_pos)
+                    chunk_end = max([b for b in valid_sentences if b > current_pos], default=None)
+            
+            # Fall back to word boundary if no sentence boundary found
+            if chunk_end is None:
+                chunk_end = find_nearest_word_boundary(text, target_end, word_boundaries, lookback_chars)
             
             # Ensure we make progress (don't get stuck at same position)
             if chunk_end <= current_pos:
@@ -285,14 +432,24 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     default=15.0,
                     min=5.0,
                     max=50.0,
-                    tooltip="Characters per second (speaking rate). Used to estimate chunk boundaries."
+                    tooltip="Base characters per second (speaking rate). Used to estimate chunk boundaries. "
+                           "Actual CPS may vary per sentence based on emotion intensity and punctuation."
+                ),
+                io.Float.Input(
+                    "emotion_intensity",
+                    default=1.0,
+                    min=0.0,
+                    max=2.0,
+                    tooltip="Emotion intensity (0.0 = neutral, 1.0 = normal, 2.0 = very expressive). "
+                           "Higher values make exclamations (!) more energetic and questions (?) more thoughtful. "
+                           "Helps get closer to OpenAI TTS quality for emotional expression."
                 ),
                 io.Float.Input(
                     "max_chunk_duration",
                     default=25.0,
                     min=5.0,
                     max=30.0,
-                    tooltip="Maximum duration per chunk in seconds. Text exceeding this will be split at word boundaries."
+                    tooltip="Maximum duration per chunk in seconds. Text exceeding this will be split at sentence boundaries when possible."
                 ),
                 io.Int.Input(
                     "lookback_chars",
@@ -309,19 +466,33 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     tooltip="Number of tokens from previous chunk to use as prompt for continuity. "
                            "Higher values maintain better prosody/intonation but use more memory."
                 ),
+                io.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=0x7fffffff,
+                    optional=True,
+                    tooltip="Random seed for reproducibility. 0 = random. Set to a fixed value for consistent results."
+                ),
                 io.Combo.Input(
                     "t2s_ref",
                     options=get_whisperspeech_models()[0],
                     default="",
                     optional=True,
-                    tooltip="Text-to-semantic model from models/audio_encoders folder. Empty string uses default. Download models using script_examples/download_whisperspeech_models.py"
+                    tooltip="Text-to-semantic model from models/audio_encoders folder. "
+                           "Empty string uses default. "
+                           "Options: tiny (fastest), small (balanced), medium (quality), fast-small (optimized). "
+                           "Download models using script_examples/download_whisperspeech_models.py"
                 ),
                 io.Combo.Input(
                     "s2a_ref",
                     options=get_whisperspeech_models()[1],
                     default="",
                     optional=True,
-                    tooltip="Semantic-to-audio model from models/audio_encoders folder. Empty string uses default. Download models using script_examples/download_whisperspeech_models.py"
+                    tooltip="Semantic-to-audio model from models/audio_encoders folder. "
+                           "Empty string uses default. "
+                           "Options: q4-small (fast), q4-hq-fast (high quality), v1.1-small (alternative). "
+                           "Download models using script_examples/download_whisperspeech_models.py"
                 ),
             ],
             outputs=[io.Audio.Output()],
@@ -333,13 +504,29 @@ class WhisperSpeechGenerate(io.ComfyNode):
         text: str,
         lang: str = "en",
         cps: float = 15.0,
+        emotion_intensity: float = 1.0,
         max_chunk_duration: float = 25.0,
         lookback_chars: int = 50,
         prompt_tokens: int = 50,
+        seed: Optional[int] = None,
         reference_audio: Optional[io.Audio] = None,
         t2s_ref: Optional[str] = None,
         s2a_ref: Optional[str] = None
     ) -> io.NodeOutput:
+        # Set random seed for reproducibility
+        if seed is not None and seed > 0:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            logging.info(f"Using seed: {seed}")
+        
+        # Preprocess text for emotional expression
+        if emotion_intensity > 0.0:
+            original_text = text
+            text = preprocess_text_for_emotion(text, emotion_intensity)
+            if text != original_text:
+                logging.info(f"Preprocessed text for emotion (intensity: {emotion_intensity:.2f})")
+        
         # Normalize language code - WhisperSpeech doesn't support regional variants (e.g., en-US, en-GB)
         # Strip regional suffix if present (e.g., "en-US" -> "en", "es-MX" -> "es")
         if '-' in lang or '_' in lang:
@@ -580,8 +767,25 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 # Update progress: starting generation
                 progress_bar.update_absolute(current_progress, total=total_progress_steps)
                 
+                # Get CPS modulation for full text (if emotion is enabled)
+                full_text_cps = cps
+                if emotion_intensity > 0.0:
+                    cps_segments = get_sentence_cps_modulation(text, cps, emotion_intensity)
+                    # Use average CPS for full text generation (or first segment)
+                    if cps_segments:
+                        # Weighted average based on segment lengths
+                        total_weight = 0
+                        weighted_cps = 0
+                        for seg_start, seg_end, multiplier in cps_segments:
+                            seg_len = seg_end - seg_start
+                            weighted_cps += cps * multiplier * seg_len
+                            total_weight += seg_len
+                        if total_weight > 0:
+                            full_text_cps = weighted_cps / total_weight
+                            logging.info(f"Using modulated CPS for full text: {full_text_cps:.2f} (base: {cps:.2f}, intensity: {emotion_intensity:.2f})")
+                
                 # Generate semantic tokens
-                stoks_result = pipe.t2s.generate(text, cps=cps, lang=lang, stoks_prompt=None)
+                stoks_result = pipe.t2s.generate(text, cps=full_text_cps, lang=lang, stoks_prompt=None)
                 stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
                 
                 # Normalize stoks to 1D
@@ -669,8 +873,8 @@ class WhisperSpeechGenerate(io.ComfyNode):
             f"Splitting into chunks at word boundaries (max {max_chunk_duration}s per chunk)."
         )
         
-        # Split text into chunks using measured CPS
-        chunks = chunk_text_for_tts(text, max_chunk_duration, actual_cps, lookback_chars)
+        # Split text into chunks using measured CPS, preferring sentence boundaries for emotional continuity
+        chunks = chunk_text_for_tts(text, max_chunk_duration, actual_cps, lookback_chars, prefer_sentences=True)
         
         # Verify all text is covered
         total_chunked_chars = sum(end - start for start, end, _ in chunks)
@@ -686,6 +890,11 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     chunks.append((last_end, len(text), missing_text))
         
         logging.info(f"Split text into {len(chunks)} chunks (total {sum(end - start for start, end, _ in chunks)} chars)")
+        
+        # Get CPS modulation segments for emotional expression
+        cps_segments = get_sentence_cps_modulation(text, actual_cps, emotion_intensity)
+        if emotion_intensity > 0.0:
+            logging.info(f"Applied emotion intensity {emotion_intensity:.2f} - {len(cps_segments)} CPS modulation segments")
         
         # Generate audio for each chunk with sliding window continuity
         # Use atoks_prompt to maintain prosody/intonation across chunks
@@ -704,6 +913,18 @@ class WhisperSpeechGenerate(io.ComfyNode):
         
         for i, (start_pos, end_pos, chunk_text) in enumerate(chunks):
             logging.info(f"Generating chunk {i+1}/{len(chunks)}: '{chunk_text[:50]}...' ({end_pos - start_pos} chars)")
+            
+            # Calculate CPS for this chunk based on its position and emotion modulation
+            chunk_cps = actual_cps
+            if emotion_intensity > 0.0 and cps_segments:
+                # Find which segment(s) this chunk overlaps with
+                chunk_center = (start_pos + end_pos) / 2
+                for seg_start, seg_end, multiplier in cps_segments:
+                    if seg_start <= chunk_center < seg_end:
+                        chunk_cps = actual_cps * multiplier
+                        if multiplier != 1.0:
+                            logging.info(f"  Applying CPS modulation: {multiplier:.2f}x (CPS: {chunk_cps:.2f})")
+                        break
             
             # Update progress: starting chunk
             chunk_progress_base = current_progress + i
@@ -725,7 +946,7 @@ class WhisperSpeechGenerate(io.ComfyNode):
             
             stoks_result = pipe.t2s.generate(
                 chunk_text, 
-                cps=cps, 
+                cps=chunk_cps,  # Use modulated CPS for emotional expression
                 lang=lang, 
                 stoks_prompt=None,  # Disabled to prevent text repetition
                 step=track_chunk_steps
