@@ -103,5 +103,3 @@ print("\nDone! Check ComfyUI to see the images generating.")
 
 
 
-
-

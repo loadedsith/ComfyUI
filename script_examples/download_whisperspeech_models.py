@@ -32,9 +32,11 @@ T2S_MODELS = [
 ]
 
 S2A_MODELS = [
-    "collabora/whisperspeech:s2a-q4-hq-fast-en+pl.model",  # Fast, high quality
-    "collabora/whisperspeech:s2a-q4-small-en+pl.model",  # Small, fast
-    "collabora/whisperspeech:s2a-v1.1-small-en+pl.model",  # Alternative version
+    "collabora/whisperspeech:s2a-q4-hq-fast-en+pl.model",  # Fast, high quality (English/Polish)
+    "collabora/whisperspeech:s2a-q4-small-en+pl.model",  # Small, fast (English/Polish)
+    "collabora/whisperspeech:s2a-v1.1-small-en+pl.model",  # Alternative version (English/Polish)
+    "collabora/whisperspeech:s2a-v1.9-medium-7lang.model",  # Multilingual (7 languages) - REQUIRED for multilingual T2S
+    "collabora/whisperspeech:s2a-v1.9-base-7lang.model",  # Multilingual base version
 ]
 
 def download_model(ref: str, model_type: str, output_dir: Path):

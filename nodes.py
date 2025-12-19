@@ -2128,21 +2128,41 @@ def get_module_name(module_path: str) -> str:
 
 async def load_custom_node(module_path: str, ignore=set(), module_parent="custom_nodes") -> bool:
     module_name = get_module_name(module_path)
+    # Initialize sys_module_name to avoid UnboundLocalError
+    sys_module_name = module_name
+    
+    # Check if the path exists at all
+    if not os.path.exists(module_path):
+        logging.warning(f"Module path does not exist: {module_path}")
+        return False
+    
     if os.path.isfile(module_path):
         sp = os.path.splitext(module_path)
         module_name = sp[0]
         sys_module_name = module_name
     elif os.path.isdir(module_path):
         sys_module_name = module_path.replace(".", "_x_")
+    else:
+        # Path exists but is neither file nor directory (shouldn't happen, but handle it)
+        logging.warning(f"Module path exists but is neither file nor directory: {module_path}")
+        return False
 
     try:
         logging.debug("Trying to load custom node {}".format(module_path))
         if os.path.isfile(module_path):
             module_spec = importlib.util.spec_from_file_location(sys_module_name, module_path)
             module_dir = os.path.split(module_path)[0]
-        else:
-            module_spec = importlib.util.spec_from_file_location(sys_module_name, os.path.join(module_path, "__init__.py"))
+        elif os.path.isdir(module_path):
+            # Double-check it's actually a directory before trying to load __init__.py
+            init_path = os.path.join(module_path, "__init__.py")
+            if not os.path.exists(init_path):
+                logging.warning(f"Directory {module_path} does not contain __init__.py")
+                return False
+            module_spec = importlib.util.spec_from_file_location(sys_module_name, init_path)
             module_dir = module_path
+        else:
+            logging.warning(f"Cannot determine if {module_path} is a file or directory")
+            return False
 
         module = importlib.util.module_from_spec(module_spec)
         sys.modules[sys_module_name] = module
@@ -2358,7 +2378,7 @@ async def init_builtin_extra_nodes():
         "nodes_rope.py",
         "nodes_logic.py",
         "nodes_nop.py",
-        "nodes_diffusers_pipeline.py",
+        # "nodes_diffusers_pipeline.py",  # Commented out - file does not exist
     ]
 
     import_failed = []
