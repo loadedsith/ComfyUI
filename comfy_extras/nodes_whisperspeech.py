@@ -16,6 +16,22 @@ import comfy.utils
 
 import folder_paths
 
+try:
+    from importlib.metadata import version as pkg_version
+except ImportError:  # Python<3.8 fallback (should not happen in ComfyUI runtimes)
+    pkg_version = None
+
+def get_whisperspeech_version() -> str:
+    """Return currently installed whisperspeech package version (or placeholder)."""
+    if pkg_version is None:
+        return "unknown"
+    try:
+        return pkg_version("whisperspeech")
+    except Exception:
+        return "not installed"
+
+WHISPERSPEECH_VERSION = get_whisperspeech_version()
+
 def get_whisperspeech_models():
     """
     Get list of available WhisperSpeech models from local models/audio_encoders folder.
@@ -60,44 +76,14 @@ def preprocess_text_for_emotion(text: str, emotion_intensity: float = 1.0) -> st
     Returns:
         Preprocessed text with enhanced emotional markers
     """
-    if emotion_intensity <= 0.0:
-        return text
+    # Disable text preprocessing - it can create weird prosody artifacts
+    # The CPS modulation should be enough for emotional expression
+    return text
     
-    # Split into sentences to process each independently
-    sentences = re.split(r'([.!?]+)', text)
-    processed_sentences = []
-    
-    for i, sentence in enumerate(sentences):
-        if not sentence.strip():
-            processed_sentences.append(sentence)
-            continue
-        
-        # Detect exclamation marks - enhance them
-        if '!' in sentence and emotion_intensity > 0.5:
-            # Add slight spacing before exclamation for emphasis
-            # Multiple exclamations = more intensity
-            exclamation_count = sentence.count('!')
-            if exclamation_count > 1:
-                # Multiple !!! = very excited
-                sentence = sentence.replace('!!!', ' !!! ')
-                sentence = sentence.replace('!!', ' !! ')
-            elif exclamation_count == 1:
-                # Single ! = moderate excitement
-                sentence = sentence.replace('!', ' !', 1)
-        
-        # Detect question marks - add slight pause
-        if '?' in sentence and emotion_intensity > 0.5:
-            question_count = sentence.count('?')
-            if question_count > 1:
-                sentence = sentence.replace('???', ' ??? ')
-                sentence = sentence.replace('??', ' ?? ')
-        
-        processed_sentences.append(sentence)
-    
-    result = ''.join(processed_sentences)
-    # Clean up multiple spaces
-    result = re.sub(r' +', ' ', result)
-    return result.strip()
+    # Original preprocessing code (disabled to preserve natural speech):
+    # if emotion_intensity <= 0.0:
+    #     return text
+    # ... rest of preprocessing
 
 
 def get_sentence_cps_modulation(text: str, base_cps: float, emotion_intensity: float = 1.0) -> List[Tuple[int, int, float]]:
@@ -275,8 +261,9 @@ def chunk_text_for_tts(
     # Calculate max characters per chunk (with some margin for safety)
     max_chars_per_chunk = int(max_chunk_duration * cps * 0.9)  # 90% to be safe
     
-    # Minimum chunk size to ensure progress
-    min_chunk_size = max(10, max_chars_per_chunk // 4)
+    # Minimum chunk size to ensure progress and avoid too-small chunks
+    # Very small chunks (less than ~20 chars) often produce too few tokens (<3) which causes errors
+    min_chunk_size = max(20, max_chars_per_chunk // 4)
     
     while current_pos < total_chars:
         remaining_chars = total_chars - current_pos
@@ -387,6 +374,91 @@ def apply_fade_out(audio_tensor, fade_duration_ms=20, sample_rate=24000):
     return audio_tensor
 
 
+def apply_fade_in(audio_tensor, fade_duration_ms=20, sample_rate=24000):
+    """
+    Apply a fade-in to the beginning of audio to prevent clicks.
+    
+    Args:
+        audio_tensor: Audio tensor of shape [batch, channels, samples]
+        fade_duration_ms: Fade-in duration in milliseconds
+        sample_rate: Sample rate of the audio
+    
+    Returns:
+        Audio tensor with fade-in applied
+    """
+    fade_samples = int(fade_duration_ms * sample_rate / 1000.0)
+    batch_size, num_channels, num_samples = audio_tensor.shape
+    
+    if num_samples <= fade_samples:
+        # Audio is shorter than fade duration, fade entire audio
+        fade_samples = num_samples
+    
+    # Create fade-in envelope (linear fade from 0.0 to 1.0)
+    fade_envelope = torch.linspace(0.0, 1.0, fade_samples, device=audio_tensor.device, dtype=audio_tensor.dtype)
+    
+    # Apply fade to first fade_samples of each channel
+    audio_tensor = audio_tensor.clone()  # Don't modify original
+    audio_tensor[:, :, :fade_samples] *= fade_envelope.unsqueeze(0).unsqueeze(0)
+    
+    return audio_tensor
+
+
+def crossfade_audio(audio1, audio2, crossfade_duration_ms=50, sample_rate=24000):
+    """
+    Crossfade between two audio chunks to create smooth transitions.
+    
+    Args:
+        audio1: First audio tensor [batch, channels, samples]
+        audio2: Second audio tensor [batch, channels, samples]
+        crossfade_duration_ms: Crossfade duration in milliseconds
+        sample_rate: Sample rate of the audio
+    
+    Returns:
+        Crossfaded audio tensor
+    """
+    crossfade_samples = int(crossfade_duration_ms * sample_rate / 1000.0)
+    if crossfade_samples <= 0:
+        return torch.cat([audio1, audio2], dim=2)
+    
+    # Clamp overlap so it never exceeds either chunk length
+    max_overlap = min(audio1.shape[2], audio2.shape[2])
+    if crossfade_samples > max_overlap:
+        crossfade_samples = max_overlap
+    if crossfade_samples == 0:
+        # One of the chunks is empty after clamping
+        return torch.cat([audio1, audio2], dim=2)
+    
+    # Ensure both have same number of channels
+    if audio1.shape[1] != audio2.shape[1]:
+        min_channels = min(audio1.shape[1], audio2.shape[1])
+        audio1 = audio1[:, :min_channels, :]
+        audio2 = audio2[:, :min_channels, :]
+    
+    # Get the overlap regions
+    audio1_end = audio1[:, :, -crossfade_samples:]
+    audio2_start = audio2[:, :, :crossfade_samples]
+    
+    # Create crossfade envelope (fade out for audio1, fade in for audio2)
+    fade_out = torch.linspace(1.0, 0.0, crossfade_samples, device=audio1.device, dtype=audio1.dtype)
+    fade_in = torch.linspace(0.0, 1.0, crossfade_samples, device=audio2.device, dtype=audio2.dtype)
+    
+    # Apply crossfade
+    audio1_faded = audio1_end * fade_out.unsqueeze(0).unsqueeze(0)
+    audio2_faded = audio2_start * fade_in.unsqueeze(0).unsqueeze(0)
+    
+    # Combine the crossfaded regions
+    crossfaded_region = audio1_faded + audio2_faded
+    
+    # Trim audio1 (remove the crossfade region) and audio2 (remove the crossfade region)
+    audio1_trimmed = audio1[:, :, :-crossfade_samples]
+    audio2_trimmed = audio2[:, :, crossfade_samples:]
+    
+    # Concatenate: audio1_trimmed + crossfaded_region + audio2_trimmed
+    result = torch.cat([audio1_trimmed, crossfaded_region, audio2_trimmed], dim=2)
+    
+    return result
+
+
 class WhisperSpeechGenerate(io.ComfyNode):
     """
     Generate speech from text using WhisperSpeech with sliding window chunking.
@@ -415,7 +487,11 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 io.String.Input(
                     "text",
                     multiline=True,
-                    tooltip="Text to convert to speech. Long text will be automatically chunked at word boundaries."
+                    optional=True,
+                    default="",
+                    tooltip="Text to convert to speech. Can be entered directly or connected from another node. "
+                           "Long text will be automatically chunked at word boundaries. "
+                           "The text area is resizable - drag the bottom-right corner to resize."
                 ),
                 io.String.Input(
                     "lang",
@@ -471,10 +547,15 @@ class WhisperSpeechGenerate(io.ComfyNode):
                     options=get_whisperspeech_models()[0],
                     default="",
                     optional=True,
-                    tooltip="Text-to-semantic model from models/audio_encoders folder. "
-                           "Empty string uses default. "
-                           "Options: tiny (fastest), small (balanced), medium (quality), fast-small (optimized). "
-                           "Download models using script_examples/download_whisperspeech_models.py"
+                    tooltip=(
+                        "Text-to-semantic model from models/audio_encoders folder. "
+                        "Empty string uses default. "
+                        "Options: tiny (fastest), small (balanced), medium (quality), fast-small (optimized). "
+                        "Download models using script_examples/download_whisperspeech_models.py. "
+                        f"Installed whisperspeech package: {WHISPERSPEECH_VERSION}. "
+                        "Multilingual 7lang checkpoints require the latest Git build "
+                        "(pip install --upgrade \"whisperspeech @ git+https://github.com/collabora/WhisperSpeech.git\")."
+                    )
                 ),
                 io.Combo.Input(
                     "s2a_ref",
@@ -493,7 +574,7 @@ class WhisperSpeechGenerate(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        text: str,
+        text: Optional[str] = None,
         lang: str = "en",
         cps: float = 15.0,
         emotion_intensity: str = "1.0",
@@ -505,6 +586,14 @@ class WhisperSpeechGenerate(io.ComfyNode):
         t2s_ref: Optional[str] = None,
         s2a_ref: Optional[str] = None
     ) -> io.NodeOutput:
+        # Handle text input - normalize and validate
+        if text is None:
+            text = ""
+        text = str(text).strip() if text else ""
+        
+        if not text:
+            raise ValueError("Text input is required. Please provide text either via the widget or by connecting a text input node.")
+        
         # Parse and validate emotion_intensity (0.0-2.0)
         try:
             emotion_intensity_float = float(str(emotion_intensity).strip()) if emotion_intensity else 1.0
@@ -571,6 +660,58 @@ class WhisperSpeechGenerate(io.ComfyNode):
             if base_lang != lang:
                 logging.warning(f"Language code '{lang}' contains regional variant. WhisperSpeech only supports base language codes. Using '{base_lang}' instead.")
             lang = base_lang
+        
+        def _is_multilingual_model_name(name: Optional[str]) -> bool:
+            if not name:
+                return False
+            lowered = name.lower()
+            return any(tag in lowered for tag in ("7lang", "multilingual", "mlang"))
+        
+        # Detect multilingual model - may need special handling
+        is_multilingual_model = False
+        multilingual_stoks_path: Optional[Path] = None
+        if t2s_ref and t2s_ref.strip():
+            if _is_multilingual_model_name(t2s_ref):
+                is_multilingual_model = True
+                logging.info(f"Multilingual T2S model detected: {t2s_ref}")
+                
+                # Check if S2A is also multilingual - mismatch is no longer allowed
+                if s2a_ref and s2a_ref.strip():
+                    if not _is_multilingual_model_name(s2a_ref):
+                        raise RuntimeError(
+                            f"WhisperSpeech multilingual T2S model '{t2s_ref}' requires a matching multilingual "
+                            f"S2A model (e.g., 's2a-v1.9-medium-7lang.model' or 's2a-v1.9-base-7lang.model'). "
+                            f"You selected '{s2a_ref}', which only supports English/Polish semantic tokens and "
+                            f"will produce garbled audio. Please switch to a multilingual S2A checkpoint."
+                        )
+                else:
+                    # No S2A specified - will use default (which is English/Polish)
+                    logging.warning(
+                        f"⚠️ Multilingual T2S model '{t2s_ref}' detected but no S2A specified. "
+                        f"The default S2A model is English/Polish only and will produce garbled output. "
+                        f"Recommendation: Specify a multilingual S2A model like 's2a-v1.9-medium-7lang.model'."
+                    )
+                
+                # Multilingual checkpoints expect the matching stoks quantizer for voice cloning paths
+                multilingual_stoks_candidates = [
+                    "whisper-vq-stoks-v3-7lang.model",
+                    "whisper-vq-stoks-v2-7lang.model",
+                ]
+                for candidate in multilingual_stoks_candidates:
+                    try:
+                        candidate_path = folder_paths.get_full_path("audio_encoders", candidate)
+                    except Exception:
+                        candidate_path = None
+                    if candidate_path and Path(candidate_path).exists():
+                        multilingual_stoks_path = Path(candidate_path)
+                        logging.info(f"Found multilingual semantic-token model: {multilingual_stoks_path.name}")
+                        break
+                if multilingual_stoks_path is None:
+                    logging.warning(
+                        "Multilingual WhisperSpeech models expect the semantic-token quantizer "
+                        "'whisper-vq-stoks-v3-7lang.model'. Download it to models/audio_encoders/ to avoid "
+                        "garbled reference-voice extractions. See WHISPERSPEECH_MULTILINGUAL_SAMPLES.md for instructions."
+                    )
         try:
             from whisperspeech.pipeline import Pipeline
         except ImportError:
@@ -578,8 +719,37 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 "WhisperSpeech is not installed. Install it with: pip install whisperspeech"
             )
         
-        # Determine device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Determine device (CUDA, ROCm/HIP, MPS, or CPU fallback)
+        device = 'cpu'
+        using_cuda = torch.cuda.is_available()
+        using_rocm = using_cuda and getattr(torch.version, "hip", None)
+        if using_cuda:
+            device = 'cuda'
+            if using_rocm:
+                logging.info(f"ROCm/HIP backend detected (torch.version.hip={torch.version.hip}). Using AMD GPU.")
+            else:
+                logging.info(f"CUDA backend detected (torch.version.cuda={torch.version.cuda}). Using NVIDIA GPU.")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = 'mps'
+            logging.info("Apple Metal (MPS) backend detected.")
+        else:
+            logging.info("No GPU backend detected. Falling back to CPU.")
+        
+        # Check available VRAM if using CUDA
+        if device == 'cuda' and is_multilingual_model:
+            try:
+                total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)  # GB
+                free = total_memory - allocated
+                logging.info(f"GPU memory: {free:.2f} GB free out of {total_memory:.2f} GB total ({(allocated/total_memory)*100:.1f}% used)")
+                if free < 2.0:  # Less than 2GB free
+                    logging.warning(
+                        f"⚠️ Low GPU memory ({free:.2f} GB free). Multilingual models may fail to load. "
+                        f"Consider: 1) Unloading other ComfyUI models, 2) Restarting ComfyUI, "
+                        f"3) Using smaller models (t2s-small-en+pl.model instead)"
+                    )
+            except Exception as e:
+                logging.warning(f"Could not check GPU memory: {e}")
         
         # Initialize pipeline with optional custom model references
         # t2s_ref: text-to-semantic model (controls speed, quality, languages)
@@ -618,13 +788,55 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 except Exception as e:
                     logging.warning(f"Could not find local S2A model '{s2a_ref}': {e}. Using default.")
                     s2a_model_ref = None
+        elif is_multilingual_model:
+            # Auto-select multilingual S2A if multilingual T2S is used but no S2A specified
+            # Try to find a multilingual S2A model locally first
+            try:
+                available_models = folder_paths.get_filename_list("audio_encoders")
+                multilingual_s2a_models = [
+                    m for m in available_models 
+                    if m.startswith('s2a-') and m.endswith('.model') 
+                    and ('7lang' in m.lower() or 'multilingual' in m.lower() or 'mlang' in m.lower())
+                ]
+                if multilingual_s2a_models:
+                    # Use the first available multilingual S2A model
+                    auto_s2a = sorted(multilingual_s2a_models)[0]
+                    s2a_model_ref = folder_paths.get_full_path_or_raise("audio_encoders", auto_s2a)
+                    logging.info(f"Auto-selected multilingual S2A model: {auto_s2a} (to match multilingual T2S)")
+                else:
+                    # No local multilingual S2A found - suggest downloading one
+                    logging.warning(
+                        f"No multilingual S2A model found locally. The default English/Polish S2A may cause garbled output. "
+                        f"Please download a multilingual S2A model like 's2a-v1.9-medium-7lang.model' from HuggingFace."
+                    )
+                    s2a_model_ref = None
+            except Exception as e:
+                logging.warning(f"Could not auto-select multilingual S2A: {e}. Using default.")
+                s2a_model_ref = None
+        
+        # Multilingual models are larger and may run out of memory with optimization enabled
+        # Optimization sets up KV cache which uses additional VRAM
+        # Disable optimization for multilingual models to reduce memory usage
+        use_optimization = not is_multilingual_model
+        if is_multilingual_model:
+            logging.info("Disabling optimization for multilingual model to reduce VRAM usage")
         
         pipe = Pipeline(
             t2s_ref=t2s_model_ref,
             s2a_ref=s2a_model_ref,
-            optimize=True,
+            optimize=use_optimization,
             device=device
         )
+        
+        # Fix for multilingual S2A models: when optimization is disabled, dtype attribute is missing
+        # Set it manually from model parameters
+        if is_multilingual_model and not use_optimization and hasattr(pipe, 's2a'):
+            if not hasattr(pipe.s2a, 'dtype'):
+                # Infer dtype from model parameters
+                for param in pipe.s2a.parameters():
+                    pipe.s2a.dtype = param.dtype
+                    logging.info(f"Set S2A dtype to {param.dtype} (inferred from model parameters)")
+                    break
         
         sample_rate = 24000  # WhisperSpeech default
         
@@ -821,26 +1033,39 @@ class WhisperSpeechGenerate(io.ComfyNode):
                             full_text_cps = weighted_cps / total_weight
                             logging.info(f"Using modulated CPS for full text: {full_text_cps:.2f} (base: {cps:.2f}, intensity: {emotion_intensity:.2f})")
                 
-                # Generate semantic tokens
-                stoks_result = pipe.t2s.generate(text, cps=full_text_cps, lang=lang, stoks_prompt=None)
-                stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
-                
-                # Normalize stoks to 1D
-                if len(stoks.shape) > 1:
-                    stoks = stoks[0] if stoks.shape[0] == 1 else stoks[0]
-                
-                # Update progress: t2s complete, starting s2a
-                progress_bar.update_absolute(current_progress + 0.5, total=total_progress_steps)
-                
-                # Generate audio tokens with speaker embedding
-                atoks = pipe.s2a.generate(stoks, speaker_normalized, langs=None, atoks_prompt=None)
-                
-                # Update progress: s2a complete, starting vocoder
-                progress_bar.update_absolute(current_progress + 0.8, total=total_progress_steps)
-                
-                # Decode to waveform
-                audio = pipe.vocoder.decode(atoks)
-                audio = normalize_audio_shape(audio)
+                # For multilingual models, use Pipeline.generate_atoks() which may handle language correctly
+                # For other models, use manual t2s/s2a path to ensure speaker embedding is used
+                if is_multilingual_model:
+                    logging.info("Using Pipeline.generate_atoks() for multilingual model (may handle language better)")
+                    # Convert speaker_normalized [1, 192] back to [192] for generate_atoks
+                    speaker_for_pipeline = speaker_normalized.squeeze(0) if speaker_normalized.shape[0] == 1 else speaker_normalized[0]
+                    atoks = pipe.generate_atoks(text, speaker=speaker_for_pipeline, lang=lang, cps=full_text_cps)
+                    # Decode to waveform
+                    audio = pipe.vocoder.decode(atoks)
+                    audio = normalize_audio_shape(audio)
+                else:
+                    # Generate semantic tokens
+                    # text must be positional, other args can be keyword
+                    stoks_result = pipe.t2s.generate(text, cps=full_text_cps, lang=lang, stoks_prompt=None)
+                    stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
+                    
+                    # Normalize stoks to 1D
+                    if len(stoks.shape) > 1:
+                        stoks = stoks[0] if stoks.shape[0] == 1 else stoks[0]
+                    
+                    # Update progress: t2s complete, starting s2a
+                    progress_bar.update_absolute(current_progress + 0.5, total=total_progress_steps)
+                    
+                    # Generate audio tokens with speaker embedding
+                    # Note: Pipeline.generate_atoks does NOT pass langs to s2a, so we match that behavior
+                    atoks = pipe.s2a.generate(stoks, speaker_normalized, langs=None, atoks_prompt=None)
+                    
+                    # Update progress: s2a complete, starting vocoder
+                    progress_bar.update_absolute(current_progress + 0.8, total=total_progress_steps)
+                    
+                    # Decode to waveform
+                    audio = pipe.vocoder.decode(atoks)
+                    audio = normalize_audio_shape(audio)
                 
                 # Update progress: complete
                 progress_bar.update_absolute(total_progress_steps, total=total_progress_steps)
@@ -871,13 +1096,21 @@ class WhisperSpeechGenerate(io.ComfyNode):
             step_info['s2a_steps'] += 1
         
         try:
-            # Use manual t2s/s2a path to ensure speaker is used
-            test_stoks_result = pipe.t2s.generate(text[:sample_size], cps=cps, lang=lang, stoks_prompt=None)
-            test_stoks = test_stoks_result[0] if isinstance(test_stoks_result, tuple) else test_stoks_result
-            if len(test_stoks.shape) > 1:
-                test_stoks = test_stoks[0] if test_stoks.shape[0] == 1 else test_stoks[0]
-            test_atoks = pipe.s2a.generate(test_stoks, speaker_normalized, langs=None, atoks_prompt=None, step=track_steps)
-            test_audio = pipe.vocoder.decode(test_atoks)
+            # For multilingual models, use Pipeline.generate_atoks() which may handle language correctly
+            # For other models, use manual t2s/s2a path to ensure speaker is used
+            if is_multilingual_model:
+                speaker_for_pipeline = speaker_normalized.squeeze(0) if speaker_normalized.shape[0] == 1 else speaker_normalized[0]
+                test_atoks = pipe.generate_atoks(text[:sample_size], speaker=speaker_for_pipeline, lang=lang, cps=cps, step_callback=track_steps)
+                test_audio = pipe.vocoder.decode(test_atoks)
+            else:
+                # Use manual t2s/s2a path to ensure speaker is used
+                # text must be positional, other args can be keyword
+                test_stoks_result = pipe.t2s.generate(text[:sample_size], cps=cps, lang=lang, stoks_prompt=None)
+                test_stoks = test_stoks_result[0] if isinstance(test_stoks_result, tuple) else test_stoks_result
+                if len(test_stoks.shape) > 1:
+                    test_stoks = test_stoks[0] if test_stoks.shape[0] == 1 else test_stoks[0]
+                test_atoks = pipe.s2a.generate(test_stoks, speaker_normalized, langs=None, atoks_prompt=None, step=track_steps)
+                test_audio = pipe.vocoder.decode(test_atoks)
             test_audio = normalize_audio_shape(test_audio)
             test_duration = test_audio.shape[2] / sample_rate if len(test_audio.shape) >= 3 else test_audio.shape[1] / sample_rate
             
@@ -928,6 +1161,35 @@ class WhisperSpeechGenerate(io.ComfyNode):
         
         logging.info(f"Split text into {len(chunks)} chunks (total {sum(end - start for start, end, _ in chunks)} chars)")
         
+        # Filter out very small chunks that would cause errors
+        # Merge chunks that are too small (< 20 chars) with adjacent chunks
+        filtered_chunks = []
+        for i, (start_pos, end_pos, chunk_text) in enumerate(chunks):
+            if len(chunk_text.strip()) < 20 and i > 0:
+                # Merge with previous chunk if it exists
+                if filtered_chunks:
+                    prev_start, prev_end, prev_text = filtered_chunks[-1]
+                    # Merge: extend previous chunk to include this one
+                    filtered_chunks[-1] = (prev_start, end_pos, text[prev_start:end_pos].strip())
+                    logging.info(f"Merged small chunk {i+1} ({len(chunk_text)} chars) with previous chunk")
+                elif i < len(chunks) - 1:
+                    # Merge with next chunk if no previous chunk
+                    next_start, next_end, next_text = chunks[i + 1]
+                    merged_text = text[start_pos:next_end].strip()
+                    filtered_chunks.append((start_pos, next_end, merged_text))
+                    logging.info(f"Merged small chunk {i+1} ({len(chunk_text)} chars) with next chunk")
+                    # Skip the next chunk since we merged it
+                    continue
+                else:
+                    # Last chunk and it's small - just include it anyway
+                    filtered_chunks.append((start_pos, end_pos, chunk_text))
+            else:
+                filtered_chunks.append((start_pos, end_pos, chunk_text))
+        
+        if len(filtered_chunks) < len(chunks):
+            logging.info(f"Filtered chunks: {len(chunks)} -> {len(filtered_chunks)} (removed/merged {len(chunks) - len(filtered_chunks)} very small chunks)")
+            chunks = filtered_chunks
+        
         # Get CPS modulation segments for emotional expression
         cps_segments = get_sentence_cps_modulation(text, actual_cps, emotion_intensity)
         if emotion_intensity > 0.0:
@@ -941,6 +1203,8 @@ class WhisperSpeechGenerate(io.ComfyNode):
         audio_chunks = []
         stoks_prompt = None  # Not used - causes text repetition
         atoks_prompt = None  # Audio tokens from previous chunk (used for continuity)
+        # When we can't reuse prompts (multilingual path), use gentle crossfades to hide seams
+        crossfade_duration_ms = 30 if is_multilingual_model else 0
         
         logging.info(f"Using speaker embedding: shape {speaker_normalized.shape} (will be reused for all {len(chunks)} chunks)")
         
@@ -975,160 +1239,224 @@ class WhisperSpeechGenerate(io.ComfyNode):
                 # Just track total steps
                 chunk_steps['s2a_steps'] += 1
             
-            # Generate semantic tokens (stoks) from text
-            # Note: We don't use stoks_prompt because it causes text repetition
-            # (t2s.generate prepends stoks_prompt, which duplicates tokens)
-            # Instead, we rely on atoks_prompt for audio-level continuity
-            progress_bar.update_absolute(chunk_progress_base + 0.2, total=total_progress_steps)
-            
-            stoks_result = pipe.t2s.generate(
-                chunk_text, 
-                cps=chunk_cps,  # Use modulated CPS for emotional expression
-                lang=lang, 
-                stoks_prompt=None,  # Disabled to prevent text repetition
-                step=track_chunk_steps
-            )
-            stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
-            
-            # Update progress: t2s complete
-            progress_bar.update_absolute(chunk_progress_base + 0.4, total=total_progress_steps)
-            
-            # Log original shapes for debugging
-            logging.info(f"  Raw stoks shape: {stoks.shape}, speaker shape: {speaker_normalized.shape}")
-            
-            # s2a.generate() expects:
-            # - stoks: 1D [sequence] - it uses len(stoks) and adds batch dim internally with .unsqueeze(0)
-            # - speakers: 2D [batch, features] - it does speakers.repeat(bs, 1) which requires 2D
-            original_stoks_shape = stoks.shape
-            
-            # Normalize stoks to 1D [sequence] for s2a.generate
-            if len(stoks.shape) == 1:
-                # Already 1D [sequence] - perfect
-                stoks_final = stoks
-            elif len(stoks.shape) == 2:
-                # 2D [batch, sequence] - remove batch dimension, take first batch
-                if stoks.shape[0] > 1:
-                    stoks_final = stoks[0]  # Take first batch, removes batch dim -> [sequence]
-                else:
-                    stoks_final = stoks.squeeze(0)  # Remove batch dim -> [sequence]
+            # For multilingual models, use generate_atoks() which handles language correctly
+            # For other models, use manual t2s/s2a path to support atoks_prompt for continuity
+            if is_multilingual_model:
+                # Use generate_atoks() for multilingual models (loses atoks_prompt continuity but works correctly)
+                logging.info("  Using Pipeline.generate_atoks() for multilingual model chunk")
+                progress_bar.update_absolute(chunk_progress_base + 0.2, total=total_progress_steps)
+                
+                # Convert speaker_normalized [1, 192] back to [192] for generate_atoks
+                speaker_for_pipeline = speaker_normalized.squeeze(0) if speaker_normalized.shape[0] == 1 else speaker_normalized[0]
+                
+                atoks = pipe.generate_atoks(
+                    chunk_text,
+                    speaker=speaker_for_pipeline,
+                    lang=lang,
+                    cps=chunk_cps,
+                    step_callback=track_chunk_steps
+                )
+                # Decode audio tokens to waveform
+                chunk_audio = pipe.vocoder.decode(atoks)
+                chunk_audio = normalize_audio_shape(chunk_audio)
+                
+                # Validate chunk_audio has content
+                if chunk_audio.numel() == 0:
+                    logging.warning(f"  Chunk {i+1} produced empty audio. Skipping.")
+                    continue
+                
+                # Update progress: chunk complete
+                progress_bar.update_absolute(chunk_progress_base + 1, total=total_progress_steps)
+                
+                if not (crossfade_duration_ms > 0 and i < len(chunks) - 1):
+                    chunk_audio = apply_fade_out(chunk_audio, fade_duration_ms=5, sample_rate=sample_rate)
+                
+                audio_chunks.append(chunk_audio)
+                logging.info(f"  Generated chunk {i+1}/{len(chunks)}: {chunk_audio.shape[2] / sample_rate:.2f}s")
+                
+                # For multilingual models, we don't use atoks_prompt (generate_atoks doesn't support it)
+                # This means chunks won't have perfect continuity, but it should work
+                atoks_prompt = None
+                continue  # Skip the manual path code below
             else:
-                # 3D+ - flatten to 1D by taking first batch and flattening
-                logging.warning(f"  Unexpected stoks shape {stoks.shape}, flattening to 1D")
-                # Take first batch and ensure 1D
-                while len(stoks.shape) > 1:
-                    stoks = stoks[0] if stoks.shape[0] == 1 else stoks[0]
-                stoks_final = stoks
-            
-            # Use pre-normalized speaker embedding (reused for all chunks)
-            speaker_final = speaker_normalized
-            
-            # Final validation
-            if len(stoks_final.shape) != 1:
-                raise RuntimeError(f"stoks_final must be 1D for s2a.generate, got shape {stoks_final.shape} (original: {original_stoks_shape})")
-            if len(speaker_final.shape) != 2:
-                raise RuntimeError(f"speaker_final must be 2D for s2a.generate, got shape {speaker_final.shape}")
-            logging.info(f"  Normalized stoks shape: {stoks_final.shape} (1D for s2a), using pre-normalized speaker: {speaker_final.shape} (2D for s2a)")
-            
-            # Generate audio tokens (atoks) from semantic tokens
-            # Use atoks_prompt from previous chunk for continuity
-            progress_bar.update_absolute(chunk_progress_base + 0.5, total=total_progress_steps)
-            
-            atoks = pipe.s2a.generate(
-                stoks_final,
-                speaker_final,
-                langs=None,
-                atoks_prompt=atoks_prompt,
-                step=track_chunk_steps
-            )
-            
-            # Update progress: s2a complete
-            progress_bar.update_absolute(chunk_progress_base + 0.8, total=total_progress_steps)
-            
-            # Decode audio tokens to waveform
-            chunk_audio = pipe.vocoder.decode(atoks)
-            
-            # Update progress: chunk complete
-            progress_bar.update_absolute(chunk_progress_base + 1, total=total_progress_steps)
-            chunk_audio = normalize_audio_shape(chunk_audio)
+                # Generate semantic tokens (stoks) from text
+                # Note: We don't use stoks_prompt because it causes text repetition
+                # (t2s.generate prepends stoks_prompt, which duplicates tokens)
+                # Instead, we rely on atoks_prompt for audio-level continuity
+                progress_bar.update_absolute(chunk_progress_base + 0.2, total=total_progress_steps)
+                
+                # text must be positional, other args can be keyword
+                stoks_result = pipe.t2s.generate(
+                    chunk_text,
+                    cps=chunk_cps,  # Use modulated CPS for emotional expression
+                    lang=lang,
+                    stoks_prompt=None,  # Disabled to prevent text repetition
+                    step=track_chunk_steps
+                )
+                stoks = stoks_result[0] if isinstance(stoks_result, tuple) else stoks_result
+                
+                # Update progress: t2s complete
+                progress_bar.update_absolute(chunk_progress_base + 0.4, total=total_progress_steps)
+                
+                # Log original shapes for debugging
+                logging.info(f"  Raw stoks shape: {stoks.shape}, speaker shape: {speaker_normalized.shape}")
+                
+                # s2a.generate() expects:
+                # - stoks: 1D [sequence] - it uses len(stoks) and adds batch dim internally with .unsqueeze(0)
+                # - speakers: 2D [batch, features] - it does speakers.repeat(bs, 1) which requires 2D
+                original_stoks_shape = stoks.shape
+                
+                # Normalize stoks to 1D [sequence] for s2a.generate
+                if len(stoks.shape) == 1:
+                    # Already 1D [sequence] - perfect
+                    stoks_final = stoks
+                elif len(stoks.shape) == 2:
+                    # 2D [batch, sequence] - remove batch dimension, take first batch
+                    if stoks.shape[0] > 1:
+                        stoks_final = stoks[0]  # Take first batch, removes batch dim -> [sequence]
+                    else:
+                        stoks_final = stoks.squeeze(0)  # Remove batch dim -> [sequence]
+                else:
+                    # 3D+ - flatten to 1D by taking first batch and flattening
+                    logging.warning(f"  Unexpected stoks shape {stoks.shape}, flattening to 1D")
+                    # Take first batch and ensure 1D
+                    while len(stoks.shape) > 1:
+                        stoks = stoks[0] if stoks.shape[0] == 1 else stoks[0]
+                    stoks_final = stoks
+                
+                # Use pre-normalized speaker embedding (reused for all chunks)
+                speaker_final = speaker_normalized
+                
+                # Final validation
+                if len(stoks_final.shape) != 1:
+                    raise RuntimeError(f"stoks_final must be 1D for s2a.generate, got shape {stoks_final.shape} (original: {original_stoks_shape})")
+                if len(speaker_final.shape) != 2:
+                    raise RuntimeError(f"speaker_final must be 2D for s2a.generate, got shape {speaker_final.shape}")
+                
+                # Check minimum token count - WhisperSpeech needs at least a few tokens to work properly
+                # Very small chunks (1-2 tokens) cause dimension mismatches in the attention mechanism
+                min_tokens = 3
+                if len(stoks_final) < min_tokens:
+                    logging.warning(
+                        f"  Chunk {i+1} has only {len(stoks_final)} token(s), which is too small for processing. "
+                        f"Minimum required: {min_tokens}. Skipping this chunk and merging with previous if available."
+                    )
+                    # Skip this chunk - don't generate audio for it
+                    # If there's a previous chunk, we'll just continue without this one
+                    # If this is the first chunk, we need to handle it differently
+                    if i == 0:
+                        # First chunk can't be skipped - try to pad it or use a fallback
+                        logging.warning(f"  First chunk is too small ({len(stoks_final)} tokens). Attempting to process anyway...")
+                    else:
+                        # Skip this chunk and continue to next
+                        logging.info(f"  Skipping chunk {i+1} due to insufficient tokens")
+                        continue
+                
+                logging.info(f"  Normalized stoks shape: {stoks_final.shape} (1D for s2a), using pre-normalized speaker: {speaker_final.shape} (2D for s2a)")
+                
+                # Generate audio tokens (atoks) from semantic tokens
+                # Use atoks_prompt from previous chunk for continuity
+                progress_bar.update_absolute(chunk_progress_base + 0.5, total=total_progress_steps)
+                
+                try:
+                    # Note: Pipeline.generate_atoks does NOT pass langs to s2a, so we match that behavior
+                    # For chunked generation, we must use manual path to support atoks_prompt for continuity
+                    atoks = pipe.s2a.generate(
+                        stoks_final,
+                        speaker_final,
+                        langs=None,  # Match Pipeline behavior - don't pass langs
+                        atoks_prompt=atoks_prompt,
+                        step=track_chunk_steps
+                    )
+                except RuntimeError as e:
+                    if "size of tensor" in str(e) and len(stoks_final) < 10:
+                        # Likely a dimension mismatch due to very small chunk
+                        logging.error(
+                            f"  Failed to generate audio for chunk {i+1} ({len(stoks_final)} tokens): {e}. "
+                            f"Chunk is too small. Skipping this chunk."
+                        )
+                        continue
+                    else:
+                        # Re-raise other errors
+                        raise
+                
+                # Update progress: s2a complete
+                progress_bar.update_absolute(chunk_progress_base + 0.8, total=total_progress_steps)
+                
+                # Decode audio tokens to waveform
+                chunk_audio = pipe.vocoder.decode(atoks)
+                
+                # Update progress: chunk complete
+                progress_bar.update_absolute(chunk_progress_base + 1, total=total_progress_steps)
+                chunk_audio = normalize_audio_shape(chunk_audio)
+                
+                # Validate chunk_audio has content
+                if chunk_audio.numel() == 0:
+                    logging.warning(f"  Chunk {i+1} produced empty audio, skipping")
+                    continue
             
             chunk_duration = chunk_audio.shape[2] / sample_rate if len(chunk_audio.shape) >= 3 else chunk_audio.shape[1] / sample_rate
             logging.info(f"  Chunk {i+1} generated: {chunk_duration:.2f}s ({chunk_steps['s2a_steps']} steps)")
             
-            # Trim overlap from the beginning of chunks (except the first)
-            # atoks_prompt causes the model to include those tokens in the output, creating overlap
-            # We need to trim the overlap to prevent repetition between chunks
-            if i > 0 and atoks_prompt is not None:  # Not the first chunk and we used a prompt
-                # Estimate overlap duration based on prompt_tokens
-                # Calculate token count in this chunk's atoks
-                if len(atoks.shape) >= 2:
-                    total_tokens = atoks.shape[-1]  # Last dimension is tokens
-                    if total_tokens > 0:
-                        # Estimate overlap as proportion of prompt_tokens to total tokens
-                        # Use a conservative estimate: prompt_tokens represents some duration
-                        # We'll estimate based on the chunk's token-to-duration ratio
-                        tokens_per_second = total_tokens / chunk_duration if chunk_duration > 0 else 0
-                        if tokens_per_second > 0:
-                            # Estimate overlap duration from prompt_tokens
-                            overlap_duration = prompt_tokens_int / tokens_per_second
-                            # Add a buffer (20%) to ensure we trim enough - the model may include
-                            # more overlap than just the prompt tokens
-                            overlap_duration *= 1.2
-                            
-                            # Convert to samples
-                            overlap_samples = int(overlap_duration * sample_rate)
-                            
-                            # Trim from the beginning (dim=2 is samples dimension for [batch, channels, samples])
-                            if len(chunk_audio.shape) >= 3:
-                                total_samples = chunk_audio.shape[2]
-                            else:
-                                total_samples = chunk_audio.shape[1]
-                            
-                            if overlap_samples > 0 and overlap_samples < total_samples:
-                                # Trim overlap from start
-                                if len(chunk_audio.shape) >= 3:
-                                    chunk_audio = chunk_audio[:, :, overlap_samples:]
-                                else:
-                                    chunk_audio = chunk_audio[:, overlap_samples:]
-                                
-                                new_duration = (total_samples - overlap_samples) / sample_rate
-                                logging.info(f"  Trimmed {overlap_duration:.2f}s ({overlap_samples} samples) overlap from chunk {i+1}, new duration: {new_duration:.2f}s")
-                            elif overlap_samples >= total_samples:
-                                logging.warning(f"  Overlap estimate ({overlap_duration:.2f}s) exceeds chunk duration ({chunk_duration:.2f}s), skipping trim")
+            # Apply minimal fade-out when we're not crossfading into the next chunk
+            if not (crossfade_duration_ms > 0 and i < len(chunks) - 1):
+                chunk_audio = apply_fade_out(chunk_audio, fade_duration_ms=5, sample_rate=sample_rate)
             
             audio_chunks.append(chunk_audio)
             
             # Extract last N tokens for next chunk's prompt (sliding window)
             # Only use atoks_prompt for audio-level continuity (stoks_prompt causes text repetition)
+            # Reset atoks_prompt only if we detect potential issues (very long sequences)
+            # This maintains prosody/intonation quality while preventing error accumulation
             if i < len(chunks) - 1:  # Not the last chunk
-                # Extract last prompt_tokens tokens from atoks for audio continuity
-                # s2a.generate expects atoks_prompt as [batch, quantizers, tokens]
-                # Usage: toks[:,i,1+i:start+i+1] = atoks_prompt[:,i] requires atoks_prompt[:,i] to be [batch, tokens]
-                if len(atoks.shape) == 3:
-                    # [batch, quantizers, tokens] - extract and keep batch dimension
-                    token_dim = atoks.shape[2]
-                    if token_dim > prompt_tokens_int:
-                        atoks_prompt = atoks[:, :, -prompt_tokens_int:]  # Keep batch dim: [batch, quantizers, prompt_tokens]
-                    else:
-                        atoks_prompt = atoks  # Keep all: [batch, quantizers, tokens]
-                elif len(atoks.shape) == 2:
-                    # [quantizers, tokens] - add batch dimension
-                    token_dim = atoks.shape[1]
-                    if token_dim > prompt_tokens_int:
-                        atoks_prompt = atoks[:, -prompt_tokens_int:].unsqueeze(0)  # Add batch: [1, quantizers, prompt_tokens]
-                    else:
-                        atoks_prompt = atoks.unsqueeze(0)  # Add batch: [1, quantizers, tokens]
-                else:
+                # Only reset after very long sequences (every 20 chunks) to maintain quality
+                # The squeal issue was likely from other causes, not prompt accumulation
+                reset_prompt_interval = 20  # Much less frequent to preserve quality
+                should_reset = (i + 1) % reset_prompt_interval == 0
+                
+                if should_reset:
+                    logging.info(f"  Resetting atoks_prompt after {i+1} chunks (very long sequence)")
                     atoks_prompt = None
+                else:
+                    # Extract last prompt_tokens tokens from atoks for audio continuity
+                    # s2a.generate expects atoks_prompt as [batch, quantizers, tokens]
+                    # Usage: toks[:,i,1+i:start+i+1] = atoks_prompt[:,i] requires atoks_prompt[:,i] to be [batch, tokens]
+                    if len(atoks.shape) == 3:
+                        # [batch, quantizers, tokens] - extract and keep batch dimension
+                        token_dim = atoks.shape[2]
+                        if token_dim > prompt_tokens_int:
+                            atoks_prompt = atoks[:, :, -prompt_tokens_int:]  # Keep batch dim: [batch, quantizers, prompt_tokens]
+                        else:
+                            atoks_prompt = atoks  # Keep all: [batch, quantizers, tokens]
+                    elif len(atoks.shape) == 2:
+                        # [quantizers, tokens] - add batch dimension
+                        token_dim = atoks.shape[1]
+                        if token_dim > prompt_tokens_int:
+                            atoks_prompt = atoks[:, -prompt_tokens_int:].unsqueeze(0)  # Add batch: [1, quantizers, prompt_tokens]
+                        else:
+                            atoks_prompt = atoks.unsqueeze(0)  # Add batch: [1, quantizers, tokens]
+                    else:
+                        atoks_prompt = None
                 
                 # Don't use stoks_prompt - it causes text repetition when prepended by t2s.generate
                 stoks_prompt = None
                 
-                logging.info(f"  Extracted atoks_prompt shape: {atoks_prompt.shape if atoks_prompt is not None and hasattr(atoks_prompt, 'shape') else 'N/A'}")
+                if atoks_prompt is not None:
+                    logging.debug(f"  Extracted atoks_prompt shape: {atoks_prompt.shape}")
         
-        # Concatenate audio chunks along time dimension (dim=2 for [batch, channels, samples])
+        # Concatenate audio chunks - crossfade multilingual chunks to hide seams
         if audio_chunks:
-            # All chunks should be [1, channels, samples], concatenate along samples dimension
-            final_audio = torch.cat(audio_chunks, dim=2)
+            if crossfade_duration_ms > 0 and len(audio_chunks) > 1:
+                final_audio = audio_chunks[0]
+                for chunk_audio in audio_chunks[1:]:
+                    final_audio = crossfade_audio(
+                        final_audio,
+                        chunk_audio,
+                        crossfade_duration_ms=crossfade_duration_ms,
+                        sample_rate=sample_rate
+                    )
+            else:
+                final_audio = torch.cat(audio_chunks, dim=2)
         else:
             raise RuntimeError("No audio chunks were generated")
         
@@ -1161,4 +1489,3 @@ class WhisperSpeech(ComfyExtension):
 
 async def comfy_entrypoint() -> WhisperSpeech:
     return WhisperSpeech()
-

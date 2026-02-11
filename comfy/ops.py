@@ -126,6 +126,15 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
             weight = weight.dequantize()
         for f in s.weight_function:
             weight = f(weight)
+            # Ensure weight function output is on the correct device
+            if weight.device != device:
+                weight = weight.to(device)
+
+        # Final safety check: ensure weight and bias are on the correct device
+        if weight.device != device:
+            weight = weight.to(device)
+        if bias is not None and bias.device != device:
+            bias = bias.to(device)
 
     if offloadable:
         return weight, bias, (offload_stream, weight_a, bias_a)
@@ -161,6 +170,12 @@ class disable_weight_init:
 
         def forward_comfy_cast_weights(self, input):
             weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
+            # Final safety check: ensure all tensors are on the same device as input
+            device = input.device
+            if weight.device != device:
+                weight = weight.to(device)
+            if bias is not None and bias.device != device:
+                bias = bias.to(device)
             x = torch.nn.functional.linear(input, weight, bias)
             uncast_bias_weight(self, weight, bias, offload_stream)
             return x

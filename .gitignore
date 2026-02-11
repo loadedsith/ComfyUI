@@ -26,3 +26,6 @@ filtered-openapi.yaml
 uv.lock
 .systematic_test_counter
 /retrieved_images/
+lora_gallery_output/
+openimages_bow_arrow/
+youtube_audio*

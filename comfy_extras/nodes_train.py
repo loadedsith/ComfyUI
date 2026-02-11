@@ -595,6 +595,20 @@ class TrainLoraNode(io.ComfyNode):
             comfy.model_management.load_models_gpu(
                 [mp], memory_required=1e20, force_full_load=True
             )
+            # Ensure all LoRA adapters are on the same device as the model
+            model_device = next(mp.model.parameters()).device
+            for adapter in all_weight_adapters:
+                # Move adapter and all its submodules to the model device
+                # .to() should move all parameters and buffers recursively
+                adapter.to(model_device)
+                # Force all parameters and buffers to the correct device as a safety measure
+                # Use non_blocking=False to ensure synchronous moves
+                for name, param in adapter.named_parameters():
+                    if param.device != model_device:
+                        param.data = param.data.to(model_device, non_blocking=False)
+                for name, buffer in adapter.named_buffers():
+                    if buffer.device != model_device:
+                        buffer.data = buffer.data.to(model_device, non_blocking=False)
 
             # Setup sampler and guider like in test script
             loss_map = {"loss": []}
