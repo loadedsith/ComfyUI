@@ -9,6 +9,7 @@ import comfy.utils
 import node_helpers
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
+import re
 
 
 class BasicScheduler(io.ComfyNode):
@@ -296,6 +297,7 @@ class ExtendIntermediateSigmas(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="ExtendIntermediateSigmas",
+            search_aliases=["interpolate sigmas"],
             category="sampling/custom_sampling/sigmas",
             inputs=[
                 io.Sigmas.Input("sigmas"),
@@ -620,6 +622,7 @@ class SamplerSASolver(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="SamplerSASolver",
+            search_aliases=["sde"],
             category="sampling/custom_sampling/samplers",
             inputs=[
                 io.Model.Input("model"),
@@ -659,13 +662,55 @@ class SamplerSASolver(io.ComfyNode):
     get_sampler = execute
 
 
+class SamplerSEEDS2(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SamplerSEEDS2",
+            search_aliases=["sde", "exp heun"],
+            category="sampling/custom_sampling/samplers",
+            inputs=[
+                io.Combo.Input("solver_type", options=["phi_1", "phi_2"]),
+                io.Float.Input("eta", default=1.0, min=0.0, max=100.0, step=0.01, round=False, tooltip="Stochastic strength"),
+                io.Float.Input("s_noise", default=1.0, min=0.0, max=100.0, step=0.01, round=False, tooltip="SDE noise multiplier"),
+                io.Float.Input("r", default=0.5, min=0.01, max=1.0, step=0.01, round=False, tooltip="Relative step size for the intermediate stage (c2 node)"),
+            ],
+            outputs=[io.Sampler.Output()],
+            description=(
+                "This sampler node can represent multiple samplers:\n\n"
+                "seeds_2\n"
+                "- default setting\n\n"
+                "exp_heun_2_x0\n"
+                "- solver_type=phi_2, r=1.0, eta=0.0\n\n"
+                "exp_heun_2_x0_sde\n"
+                "- solver_type=phi_2, r=1.0, eta=1.0, s_noise=1.0"
+            )
+        )
+
+    @classmethod
+    def execute(cls, solver_type, eta, s_noise, r) -> io.NodeOutput:
+        sampler_name = "seeds_2"
+        sampler = comfy.samplers.ksampler(
+            sampler_name,
+            {"eta": eta, "s_noise": s_noise, "r": r, "solver_type": solver_type},
+        )
+        return io.NodeOutput(sampler)
+
+
 class Noise_EmptyNoise:
     def __init__(self):
         self.seed = 0
 
     def generate_noise(self, input_latent):
         latent_image = input_latent["samples"]
-        return torch.zeros(latent_image.shape, dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+        if latent_image.is_nested:
+            tensors = latent_image.unbind()
+            zeros = []
+            for t in tensors:
+                zeros.append(torch.zeros(t.shape, dtype=t.dtype, layout=t.layout, device="cpu"))
+            return comfy.nested_tensor.NestedTensor(zeros)
+        else:
+            return torch.zeros(latent_image.shape, dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
 
 
 class Noise_RandomNoise:
@@ -705,7 +750,7 @@ class SamplerCustom(io.ComfyNode):
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
         latent["samples"] = latent_image
 
         if not add_noise:
@@ -724,10 +769,15 @@ class SamplerCustom(io.ComfyNode):
         samples = comfy.sample.sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=noise_seed)
 
         out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
         out["samples"] = samples
         if "x0" in x0_output:
+            x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
+            if samples.is_nested:
+                latent_shapes = [x.shape for x in samples.unbind()]
+                x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
             out_denoised = latent.copy()
-            out_denoised["samples"] = model.model.process_latent_out(x0_output["x0"].cpu())
+            out_denoised["samples"] = x0_out
         else:
             out_denoised = out
         return io.NodeOutput(out, out_denoised)
@@ -817,6 +867,7 @@ class DualCFGGuider(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="DualCFGGuider",
+            search_aliases=["dual prompt guidance"],
             category="sampling/custom_sampling/guiders",
             inputs=[
                 io.Model.Input("model"),
@@ -844,6 +895,7 @@ class DisableNoise(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="DisableNoise",
+            search_aliases=["zero noise"],
             category="sampling/custom_sampling/noise",
             inputs=[],
             outputs=[io.Noise.Output()]
@@ -897,7 +949,7 @@ class SamplerCustomAdvanced(io.ComfyNode):
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(guider.model_patcher, latent_image)
+        latent_image = comfy.sample.fix_empty_latent_channels(guider.model_patcher, latent_image, latent.get("downscale_ratio_spacial", None))
         latent["samples"] = latent_image
 
         noise_mask = None
@@ -912,10 +964,15 @@ class SamplerCustomAdvanced(io.ComfyNode):
         samples = samples.to(comfy.model_management.intermediate_device())
 
         out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
         out["samples"] = samples
         if "x0" in x0_output:
+            x0_out = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
+            if samples.is_nested:
+                latent_shapes = [x.shape for x in samples.unbind()]
+                x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
             out_denoised = latent.copy()
-            out_denoised["samples"] = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
+            out_denoised["samples"] = x0_out
         else:
             out_denoised = out
         return io.NodeOutput(out, out_denoised)
@@ -971,6 +1028,26 @@ class AddNoise(io.ComfyNode):
 
     add_noise = execute
 
+class ManualSigmas(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ManualSigmas",
+            search_aliases=["custom noise schedule", "define sigmas"],
+            category="_for_testing/custom_sampling",
+            is_experimental=True,
+            inputs=[
+                io.String.Input("sigmas", default="1, 0.5", multiline=False)
+            ],
+            outputs=[io.Sigmas.Output()]
+        )
+
+    @classmethod
+    def execute(cls, sigmas) -> io.NodeOutput:
+        sigmas = re.findall(r"[-+]?(?:\d*\.*\d+)", sigmas)
+        sigmas = [float(i) for i in sigmas]
+        sigmas = torch.FloatTensor(sigmas)
+        return io.NodeOutput(sigmas)
 
 class CustomSamplersExtension(ComfyExtension):
     @override
@@ -996,6 +1073,7 @@ class CustomSamplersExtension(ComfyExtension):
             SamplerDPMAdaptative,
             SamplerER_SDE,
             SamplerSASolver,
+            SamplerSEEDS2,
             SplitSigmas,
             SplitSigmasDenoise,
             FlipSigmas,
@@ -1009,6 +1087,7 @@ class CustomSamplersExtension(ComfyExtension):
             DisableNoise,
             AddNoise,
             SamplerCustomAdvanced,
+            ManualSigmas,
         ]
 
 

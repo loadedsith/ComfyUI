@@ -141,7 +141,7 @@ async def poll_op(
     queued_statuses: list[str | int] | None = None,
     data: BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 120,
+    max_poll_attempts: int = 160,
     timeout_per_poll: float = 120.0,
     max_retries_per_poll: int = 3,
     retry_delay_per_poll: float = 1.0,
@@ -238,7 +238,7 @@ async def poll_op_raw(
     queued_statuses: list[str | int] | None = None,
     data: dict[str, Any] | BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 120,
+    max_poll_attempts: int = 160,
     timeout_per_poll: float = 120.0,
     max_retries_per_poll: int = 3,
     retry_delay_per_poll: float = 1.0,
@@ -430,9 +430,9 @@ def _display_text(
     if status:
         display_lines.append(f"Status: {status.capitalize() if isinstance(status, str) else status}")
     if price is not None:
-        p = f"{float(price):,.4f}".rstrip("0").rstrip(".")
+        p = f"{float(price) * 211:,.1f}".rstrip("0").rstrip(".")
         if p != "0":
-            display_lines.append(f"Price: ${p}")
+            display_lines.append(f"Price: {p} credits")
     if text is not None:
         display_lines.append(text)
     if display_lines:

@@ -27,11 +27,11 @@ class AudioEncoderModel():
             # Set max_chunk_length=None to allow chunking at encode_audio level
             self.model = WhisperModel(**model_config, max_chunk_length=None)
         self.model.eval()
-        self.patcher = comfy.model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
+        self.patcher = comfy.model_patcher.CoreModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
         self.model_sample_rate = 16000
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False)
+        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
 
     def get_sd(self):
         return self.model.state_dict()
