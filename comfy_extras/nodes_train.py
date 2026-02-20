@@ -1166,6 +1166,21 @@ class TrainLoraNode(io.ComfyNode):
             )
             criterion = _create_loss_function(loss_function_name)
 
+            # Ensure all LoRA adapters are on the same device as the model
+            model_device = next(mp.model.parameters()).device
+            for adapter in all_weight_adapters:
+                # Move adapter and all its submodules to the model device
+                # .to() should move all parameters and buffers recursively
+                adapter.to(model_device)
+                # Force all parameters and buffers to the correct device as a safety measure
+                # Use non_blocking=False to ensure synchronous moves
+                for name, param in adapter.named_parameters():
+                    if param.device != model_device:
+                        param.data = param.data.to(model_device, non_blocking=False)
+                for name, buffer in adapter.named_buffers():
+                    if buffer.device != model_device:
+                        buffer.data = buffer.data.to(model_device, non_blocking=False)
+
             # Setup gradient checkpointing
             if gradient_checkpointing:
                 modules_to_patch = find_modules_at_depth(

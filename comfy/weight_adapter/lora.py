@@ -19,34 +19,64 @@ class LoraDiff(WeightAdapterTrainBase):
         mat1, mat2, alpha, mid, dora_scale, reshape = weights
         out_dim, rank = mat1.shape[0], mat1.shape[1]
         rank, in_dim = mat2.shape[0], mat2.shape[1]
+        # Get device from input weights to ensure modules are created on the correct device
+        device = mat1.device
         if mid is not None:
             convdim = mid.ndim - 2
             layer = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)[convdim]
         else:
             layer = torch.nn.Linear
-        self.lora_up = layer(rank, out_dim, bias=False)
-        self.lora_down = layer(in_dim, rank, bias=False)
+        # Create modules and move them to device
+        self.lora_up = layer(rank, out_dim, bias=False).to(device)
+        self.lora_down = layer(in_dim, rank, bias=False).to(device)
         self.lora_up.weight.data.copy_(mat1)
         self.lora_down.weight.data.copy_(mat2)
         if mid is not None:
-            self.lora_mid = layer(mid, rank, bias=False)
+            self.lora_mid = layer(mid, rank, bias=False).to(device)
             self.lora_mid.weight.data.copy_(mid)
         else:
             self.lora_mid = None
         self.rank = rank
-        self.alpha = torch.nn.Parameter(torch.tensor(alpha), requires_grad=False)
+        self.alpha = torch.nn.Parameter(torch.tensor(alpha, device=device), requires_grad=False)
 
     def __call__(self, w):
         org_dtype = w.dtype
+        device = w.device
+        # Ensure all LoRA parameters are on the same device as the weight
+        # Move modules to device if needed (this moves all parameters)
+        # Use non_blocking=False to ensure synchronous moves
+        if self.lora_up.weight.device != device:
+            self.lora_up.to(device)
+            # Force synchronous move
+            self.lora_up.weight.data = self.lora_up.weight.data.to(device, non_blocking=False)
+        if self.lora_down.weight.device != device:
+            self.lora_down.to(device)
+            # Force synchronous move
+            self.lora_down.weight.data = self.lora_down.weight.data.to(device, non_blocking=False)
+
+        lora_up_weight = self.lora_up.weight
+        lora_down_weight = self.lora_down.weight
         if self.lora_mid is None:
-            diff = self.lora_up.weight @ self.lora_down.weight
+            diff = lora_up_weight @ lora_down_weight
         else:
+            if self.lora_mid.weight.device != device:
+                self.lora_mid.to(device)
+                # Force synchronous move
+                self.lora_mid.weight.data = self.lora_mid.weight.data.to(device, non_blocking=False)
+            lora_mid_weight = self.lora_mid.weight
             diff = tucker_weight_from_conv(
-                self.lora_up.weight, self.lora_down.weight, self.lora_mid.weight
+                lora_up_weight, lora_down_weight, lora_mid_weight
             )
+        # Ensure alpha is on the correct device
+        if self.alpha.device != device:
+            self.alpha.data = self.alpha.data.to(device, non_blocking=False)
         scale = self.alpha / self.rank
         weight = w + scale * diff.reshape(w.shape)
-        return weight.to(org_dtype)
+        # Ensure output is on the correct device and dtype
+        # Double-check device to handle any edge cases
+        if weight.device != device:
+            weight = weight.to(device, non_blocking=False)
+        return weight.to(dtype=org_dtype)
 
     def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
         """

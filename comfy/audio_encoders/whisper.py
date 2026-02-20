@@ -7,14 +7,15 @@ from comfy.ldm.modules.attention import optimized_attention_masked
 import comfy.ops
 
 class WhisperFeatureExtractor(nn.Module):
-    def __init__(self, n_mels=128, device=None):
+    def __init__(self, n_mels=128, device=None, max_chunk_length=None):
         super().__init__()
         self.sample_rate = 16000
         self.n_fft = 400
         self.hop_length = 160
         self.n_mels = n_mels
-        self.chunk_length = 30
-        self.n_samples = 480000
+        # max_chunk_length in seconds, None means no limit (for chunking at higher level)
+        self.max_chunk_length = max_chunk_length
+        self.n_samples = int(max_chunk_length * self.sample_rate) if max_chunk_length else None
 
         self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
@@ -34,10 +35,13 @@ class WhisperFeatureExtractor(nn.Module):
 
         for i in range(batch_size):
             aud = audio[i]
-            if aud.shape[0] > self.n_samples:
-                aud = aud[:self.n_samples]
-            elif aud.shape[0] < self.n_samples:
-                aud = F.pad(aud, (0, self.n_samples - aud.shape[0]))
+            if self.n_samples is not None:
+                # Only pad/truncate if max_chunk_length is set
+                if aud.shape[0] > self.n_samples:
+                    aud = aud[:self.n_samples]
+                elif aud.shape[0] < self.n_samples:
+                    aud = F.pad(aud, (0, self.n_samples - aud.shape[0]))
+            # If n_samples is None, process audio as-is (for chunking at higher level)
             processed_audio.append(aud)
 
         audio = torch.stack(processed_audio)
@@ -159,7 +163,17 @@ class AudioEncoder(nn.Module):
         return x, all_x
 
 
-class WhisperLargeV3(nn.Module):
+class WhisperModel(nn.Module):
+    """
+    Generalized Whisper audio encoder model supporting multiple model sizes.
+    
+    Supports all Whisper model variants:
+    - tiny: n_audio_state=384, n_audio_head=6, n_audio_layer=4
+    - base: n_audio_state=512, n_audio_head=8, n_audio_layer=6
+    - small: n_audio_state=768, n_audio_head=12, n_audio_layer=12
+    - medium: n_audio_state=1024, n_audio_head=16, n_audio_layer=24
+    - large-v2/v3: n_audio_state=1280, n_audio_head=20, n_audio_layer=32
+    """
     def __init__(
         self,
         n_mels: int = 128,
@@ -169,18 +183,38 @@ class WhisperLargeV3(nn.Module):
         n_audio_layer: int = 32,
         dtype=None,
         device=None,
-        operations=None
+        operations=None,
+        max_chunk_length=None
     ):
         super().__init__()
+        self.n_audio_ctx = n_audio_ctx
+        self.hop_length = 160  # From WhisperFeatureExtractor
+        self.sample_rate = 16000
 
-        self.feature_extractor = WhisperFeatureExtractor(n_mels=n_mels, device=device)
+        self.feature_extractor = WhisperFeatureExtractor(n_mels=n_mels, device=device, max_chunk_length=max_chunk_length)
 
         self.encoder = AudioEncoder(
             n_mels, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer,
             dtype=dtype, device=device, operations=operations
         )
 
+    def get_max_audio_samples(self):
+        """
+        Calculate maximum audio samples that can be processed in one chunk.
+        Based on n_audio_ctx (max mel frames) and hop_length.
+        """
+        # n_audio_ctx is the max number of mel frames after conv downsampling
+        # After conv stride=2, we get n_audio_ctx frames from 2*n_audio_ctx mel frames
+        # Each mel frame represents hop_length audio samples
+        max_mel_frames = self.n_audio_ctx * 2  # Account for conv stride=2
+        max_samples = max_mel_frames * self.hop_length
+        return max_samples
+
     def forward(self, audio):
         mel = self.feature_extractor(audio)
         x, all_x = self.encoder(mel)
         return x, all_x
+
+
+# Alias for backward compatibility
+WhisperLargeV3 = WhisperModel
